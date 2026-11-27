@@ -2,7 +2,7 @@
 # Subscription-usage overlay installer for oh-my-pi v19.2.1.
 #
 # Curl:
-#   curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/v0.2.3/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/v0.2.4/install.sh | bash
 #
 # Local:
 #   ./install.sh [options]
@@ -14,7 +14,7 @@
 set -euo pipefail
 
 REPO_SLUG="DoctorBlackZ33/omp-subscription-usage"
-REF="${OMP_SUB_REF:-v0.2.3}"
+REF="${OMP_SUB_REF:-v0.2.4}"
 RAW_BASE="https://raw.githubusercontent.com/$REPO_SLUG/$REF"
 OMP_TAG="${OMP_TAG:-v19.2.1}"
 PATCH_REL="patches/0001-subscription-usage-policy.patch"
@@ -53,11 +53,11 @@ Environment:
   OMP_SUBSCRIPTION_USAGE_HOME  Patched source + artifacts (default: ~/.local/share/omp-subscription-usage)
   BIN_DIR                      Launcher directory (default: ~/.local/bin)
   OMP_TAG                      Upstream tag (default: v19.2.1)
-  OMP_SUB_REF                  GitHub ref for downloaded artifacts (default: v0.2.3)
+  OMP_SUB_REF                  GitHub ref for downloaded artifacts (default: v0.2.4)
   BUN                          Bun executable
 
 Examples:
-  curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/v0.2.3/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/v0.2.4/install.sh | bash
   ./install.sh --omp-dir ~/.omp --profiles codex,work
   ./install.sh --checkout ~/src/oh-my-pi --profiles all --yes
 EOF
@@ -461,7 +461,7 @@ cat >"$LAUNCHER" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 export PATH="$(dirname "$BUN_BIN"):\$PATH"
-exec "$BUN_BIN" --cwd="$SRC/packages/coding-agent" src/cli.ts "\$@"
+exec "$BUN_BIN" "$SRC/packages/coding-agent/src/cli.ts" "\$@"
 EOF
 chmod +x "$LAUNCHER"
 
