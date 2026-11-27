@@ -28,47 +28,78 @@ source checkout with Bun.
 Requirements: `git`, network access, and a Bun-capable host. The installer
 fetches Bun if it is missing.
 
+One command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/main/install.sh | bash
+```
+
+The installer:
+
+1. Looks for the OMP directory at `~/.omp` (or `PI_CONFIG_DIR` / `XDG_DATA_HOME`
+   when set), prints it, and lets you choose a custom path.
+2. Lists every profile it finds (`default` plus `~/.omp/profiles/*/agent`) and
+   asks which profiles should receive the policy. Pick `all`, `none`, numbers
+   (`1,3`, `1-3`), or names (`codex,work`).
+3. Clones `can1357/oh-my-pi` at tag `v19.2.1` into
+   `~/.local/share/omp-subscription-usage/oh-my-pi` (or reuses it), applies the
+   patch, installs workspace deps and prebuilt native bindings.
+4. Writes `~/.local/bin/omp-subscription-usage`, copies the example YAML into
+   the selected profiles, and offers a shell function so `omp` launches the
+   patched runtime (optional; the stock binary is untouched).
+
+Non-interactive / scripted:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/main/install.sh \
+  | bash -s -- --yes --omp-dir "$HOME/.omp" --profiles all
+```
+
+Local clone (same script, artifacts read from the checkout):
+
 ```bash
 git clone https://github.com/DoctorBlackZ33/omp-subscription-usage.git
 cd omp-subscription-usage
 ./install.sh
 ```
 
-What it does:
-
-1. Clones `can1357/oh-my-pi` at tag `v19.2.1` into
-   `~/.local/share/omp-subscription-usage/oh-my-pi`.
-2. Applies `patches/0001-subscription-usage-policy.patch`.
-3. Runs `bun install --frozen-lockfile`.
-4. Installs prebuilt native bindings for Linux/macOS/Windows where available.
-5. Writes `~/.local/bin/omp-subscription-usage`.
-
 Options:
 
-```bash
-./install.sh --checkout /path/to/oh-my-pi   # patch an existing v19.2.1 checkout
-./install.sh --no-deps                     # skip bun install
-BIN_DIR=/usr/local/bin ./install.sh        # choose the launcher directory
-OMP_SUBSCRIPTION_USAGE_HOME=/opt/omp-sub ./install.sh
-```
+| Flag | Effect |
+| --- | --- |
+| `--omp-dir PATH` | OMP state root (default `~/.omp`) |
+| `--checkout PATH` | Patch an existing `v19.2.1` source checkout |
+| `--profiles LIST` | `all`, `none`, indexes/ranges (`1,3`), or names (`codex`) |
+| `--yes` | Non-interactive; all profiles, keep existing YAML |
+| `--force` | Replace existing policy files (timestamped backup) |
+| `--no-config` | Install the runtime only; write no profile YAML |
+| `--alias` | Add the `omp` shell function to `.bashrc`/`.zshrc` |
+| `--no-deps` | Skip `bun install` |
+| `--bun PATH` | Bun executable to use |
+
+Environment: `OMP_DIR`, `OMP_SUBSCRIPTION_USAGE_HOME`, `BIN_DIR`, `OMP_TAG`,
+`OMP_SUB_REF`, `BUN`.
 
 ## Add it to OMP
 
-The overlay is profile-global and opt-in. Put the policy file in the agent
-directory of the profile you already use, then launch the patched runtime:
+The policy is opt-in per profile. The installer normally does this for you; to
+do it manually:
 
 ```bash
 # Default profile
 cp ~/.local/share/omp-subscription-usage/subscription-usage.example.yml \
    ~/.omp/agent/subscription-usage.yml
-omp-subscription-usage
-```
 
-Named profile:
-
-```bash
+# Named profile
 cp ~/.local/share/omp-subscription-usage/subscription-usage.example.yml \
    ~/.omp/profiles/codex/agent/subscription-usage.yml
+```
+
+Launch the patched runtime:
+
+```bash
+omp-subscription-usage
+# or
 omp-subscription-usage --profile codex
 ```
 
@@ -81,6 +112,11 @@ Inside the session:
 The command prints the resolved config path, live per-credential meters,
 admission state, running/waiting counts, and `Restart OMP after editing`.
 Delete the YAML (or leave `providers: {}`) to disable enforcement.
+
+If you accepted `--alias` (or the interactive prompt), new shells can simply run
+`omp`; it is a shell function pointing at the launcher, not a replacement of the
+installed binary. To undo, remove the `>>> omp-subscription-usage >>>` block from
+your shell rc file.
 
 ### Isolated test profile
 
