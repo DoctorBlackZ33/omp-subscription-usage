@@ -14,7 +14,7 @@
 set -euo pipefail
 
 REPO_SLUG="DoctorBlackZ33/omp-subscription-usage"
-REF="${OMP_SUB_REF:-v0.2.0}"
+REF="${OMP_SUB_REF:-v0.2.1}"
 RAW_BASE="https://raw.githubusercontent.com/$REPO_SLUG/$REF"
 OMP_TAG="${OMP_TAG:-v19.2.1}"
 PATCH_REL="patches/0001-subscription-usage-policy.patch"
@@ -409,7 +409,7 @@ if [ -z "$BUN_BIN" ] || [ ! -x "$BUN_BIN" ]; then
 	else
 		need_curl
 		say "Installing Bun into $INSTALL_ROOT/.bun ..."
-		curl -fsSL https://bun.sh/install | BUN_INSTALL="$INSTALL_ROOT/.bun" bash
+		curl -fsSL https://bun.sh/install | SHELL=/bin/false BUN_INSTALL="$INSTALL_ROOT/.bun" bash
 		BUN_BIN="$INSTALL_ROOT/.bun/bin/bun"
 	fi
 fi
