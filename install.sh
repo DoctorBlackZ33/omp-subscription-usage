@@ -2,7 +2,7 @@
 # Subscription-usage overlay installer for oh-my-pi v19.2.1.
 #
 # Curl:
-#   curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/v0.2.3/install.sh | bash
 #
 # Local:
 #   ./install.sh [options]
@@ -14,7 +14,7 @@
 set -euo pipefail
 
 REPO_SLUG="DoctorBlackZ33/omp-subscription-usage"
-REF="${OMP_SUB_REF:-v0.2.2}"
+REF="${OMP_SUB_REF:-v0.2.3}"
 RAW_BASE="https://raw.githubusercontent.com/$REPO_SLUG/$REF"
 OMP_TAG="${OMP_TAG:-v19.2.1}"
 PATCH_REL="patches/0001-subscription-usage-policy.patch"
@@ -31,7 +31,6 @@ SKIP_DEPS=0
 ASSUME_YES=0
 FORCE=0
 NO_CONFIG=0
-WITH_ALIAS=0
 BUN_OVERRIDE="${BUN:-}"
 INTERACTIVE=1
 
@@ -46,7 +45,6 @@ Usage: install.sh [options]
   --force               Replace existing subscription-usage.yml (timestamped backup)
   --no-config           Install the patched runtime only; write no profile YAML
   --no-deps             Skip `bun install` (node_modules already prepared)
-  --alias               Add an `omp` shell function for bash/zsh pointing at the launcher
   --bun PATH            Bun executable to use
   --help                Show this help
 
@@ -55,11 +53,11 @@ Environment:
   OMP_SUBSCRIPTION_USAGE_HOME  Patched source + artifacts (default: ~/.local/share/omp-subscription-usage)
   BIN_DIR                      Launcher directory (default: ~/.local/bin)
   OMP_TAG                      Upstream tag (default: v19.2.1)
-  OMP_SUB_REF                  GitHub ref for downloaded artifacts (default: main)
+  OMP_SUB_REF                  GitHub ref for downloaded artifacts (default: v0.2.3)
   BUN                          Bun executable
 
 Examples:
-  curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/v0.2.3/install.sh | bash
   ./install.sh --omp-dir ~/.omp --profiles codex,work
   ./install.sh --checkout ~/src/oh-my-pi --profiles all --yes
 EOF
@@ -93,10 +91,6 @@ while [ $# -gt 0 ]; do
 			;;
 		--no-deps)
 			SKIP_DEPS=1
-			shift
-			;;
-		--alias)
-			WITH_ALIAS=1
 			shift
 			;;
 		--bun)
@@ -497,37 +491,6 @@ for i in "${!SELECTED_NAMES[@]}"; do
 	INSTALLED+=("$name:$target")
 done
 
-# -------------------------------------------------------------------- alias --
-install_alias() {
-	shell_name="$(basename "${SHELL:-bash}")"
-	case "$shell_name" in
-		bash) rc="$HOME/.bashrc" ;;
-		zsh) rc="$HOME/.zshrc" ;;
-		*) rc="" ;;
-	esac
-	if [ -z "$rc" ]; then
-		warn "Unsupported shell for --alias; add this manually:"
-		say "  omp() { \"$LAUNCHER\" \"\$@\"; }"
-		return
-	fi
-	if grep -q '>>> omp-subscription-usage >>>' "$rc" 2>/dev/null; then
-		say "Alias already present in $rc"
-		return
-	fi
-	{
-		printf '\n# >>> omp-subscription-usage >>>\n'
-		printf 'omp() { "%s" "$@"; }\n' "$LAUNCHER"
-		printf '# <<< omp-subscription-usage <<<\n'
-	} >>"$rc"
-	say "Added an 'omp' function to $rc (open a new shell to use it)."
-}
-if [ "$WITH_ALIAS" = "1" ]; then
-	install_alias
-elif [ "$INTERACTIVE" = "1" ] && [ "$ASSUME_YES" = "0" ]; then
-	answer="$(ask "Make 'omp' launch the patched runtime in new shells (shell function, stock binary untouched)? [y/N] " "n")"
-	case "$answer" in y | Y | yes | YES) install_alias ;; esac
-fi
-
 # ------------------------------------------------------------------ summary --
 VERSION="$("$LAUNCHER" --version 2>/dev/null | tail -1 || true)"
 say ""
@@ -543,13 +506,10 @@ if [ "${#SKIPPED[@]}" -gt 0 ]; then
 	say "  policy kept (existing): ${SKIPPED[*]}"
 fi
 say ""
-if [ "$WITH_ALIAS" = "0" ]; then
-	say "Run: $LAUNCHER"
-	say "Select a profile with: $LAUNCHER --profile <name>"
-	say "Then use /subscription-usage in the session."
-else
-	say "New shells: run 'omp' as usual. Current shell: $LAUNCHER"
-fi
+say "Run: $LAUNCHER"
+say "Select a profile with: $LAUNCHER --profile <name>"
+say "Then use /subscription-usage in the session."
+say "To use it as 'omp', add your own alias or wrapper in your shell rc."
 if [ -n "$ROOT" ]; then
 	say ""
 	say "Source installer: $INSTALL_ROOT/install.sh"

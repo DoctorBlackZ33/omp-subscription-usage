@@ -31,7 +31,7 @@ fetches Bun if it is missing.
 One command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/v0.2.2/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/v0.2.3/install.sh | bash
 ```
 
 The installer:
@@ -44,14 +44,14 @@ The installer:
 3. Clones `can1357/oh-my-pi` at tag `v19.2.1` into
    `~/.local/share/omp-subscription-usage/oh-my-pi` (or reuses it), applies the
    patch, installs workspace deps and prebuilt native bindings.
-4. Writes `~/.local/bin/omp-subscription-usage`, copies the example YAML into
-   the selected profiles, and offers a shell function so `omp` launches the
-   patched runtime (optional; the stock binary is untouched).
+4. Writes `~/.local/bin/omp-subscription-usage` and copies the example YAML into
+   the selected profiles. It never edits shell startup files; the stock `omp`
+   binary is untouched.
 
 Non-interactive / scripted:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/v0.2.2/install.sh \
+curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/v0.2.3/install.sh \
   | bash -s -- --yes --omp-dir "$HOME/.omp" --profiles all
 ```
 
@@ -73,7 +73,6 @@ Options:
 | `--yes` | Non-interactive; all profiles, keep existing YAML |
 | `--force` | Replace existing policy files (timestamped backup) |
 | `--no-config` | Install the runtime only; write no profile YAML |
-| `--alias` | Add the `omp` shell function to `.bashrc`/`.zshrc` |
 | `--no-deps` | Skip `bun install` |
 | `--bun PATH` | Bun executable to use |
 
@@ -113,10 +112,16 @@ The command prints the resolved config path, live per-credential meters,
 admission state, running/waiting counts, and `Restart OMP after editing`.
 Delete the YAML (or leave `providers: {}`) to disable enforcement.
 
-If you accepted `--alias` (or the interactive prompt), new shells can simply run
-`omp`; it is a shell function pointing at the launcher, not a replacement of the
-installed binary. To undo, remove the `>>> omp-subscription-usage >>>` block from
-your shell rc file.
+The installer does not modify shell startup files. To use the patched runtime as
+your normal command, add an alias yourself:
+
+```bash
+# ~/.bashrc or ~/.zshrc
+alias omp="$HOME/.local/bin/omp-subscription-usage"
+```
+
+The installed stock `omp` binary remains untouched; remove the alias to restore
+it.
 
 ### Isolated test profile
 
