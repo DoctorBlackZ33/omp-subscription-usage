@@ -1,0 +1,3155 @@
+diff --git a/packages/ai/src/auth-retry.ts b/packages/ai/src/auth-retry.ts
+index 86fbdcb..b67699c 100644
+--- a/packages/ai/src/auth-retry.ts
++++ b/packages/ai/src/auth-retry.ts
+@@ -40,6 +40,11 @@ export interface ApiKeyResolveContext {
+ 	previousKey?: string;
+ 	/** Caller cancel signal, threaded into any credential refresh / rotation work. */
+ 	signal?: AbortSignal;
++	/**
++	 * Internal subscription-usage admission pin forwarded to credential lookup.
++	 * Only the initial resolve of a request sets it; native restrictions apply.
++	 */
++	preferredCredentialId?: number;
+ 	/**
+ 	 * Service tier the request will ask for, so resolution can prefer a
+ 	 * credential that offers it. Stamped by {@link withRequestServiceTier}.
+@@ -47,11 +52,29 @@ export interface ApiKeyResolveContext {
+ 	serviceTier?: ServiceTier;
+ }
+ 
++/**
++ * Per-attempt local admission lease carried by a resolved credential.
++ *
++ * A background request that reserved a subscription-usage slot returns this
++ * handle with its credential. The streaming driver calls {@link reserve} before
++ * the attempt reaches a provider and awaits the returned release before the
++ * attempt's terminal event is delivered. The lease is already held; `reserve`
++ * only validates that it is still this credential's and hands back an
++ * idempotent release, so a static transport wait cannot silently swap the
++ * credential after admission.
++ */
++export interface ProviderAttemptAdmission {
++	/** Returns an idempotent release that completes after the local/remote release. */
++	reserve(credentialId: number | undefined, signal?: AbortSignal): Promise<() => Promise<void>>;
++}
++
+ /**
+  * Resolves the API key to send for a request, retried through the a/b/c policy
+  * described on {@link ApiKeyResolveContext}.
+  */
+ export interface ResolvedApiKey {
++	/** Local subscription-usage lease for this exact attempt, when admitted. */
++	providerAttemptAdmission?: ProviderAttemptAdmission;
+ 	apiKey: string;
+ 	/** Durable row id of the credential that supplied this bearer, when known. */
+ 	credentialId?: number;
+@@ -286,7 +309,10 @@ export async function resolveRetryKey(
+ 		const resolved = await resolver({ lastChance: rotateSibling, error, signal, previousKey });
+ 		onResolved?.(resolved);
+ 		return resolvedApiKeyBearer(resolved);
+-	} catch {
++	} catch (error) {
++		// A local subscription-usage denial is terminal: never downgrade it to a
++		// missing key, which would let the outer layer rotate/fallback/reset.
++		if (AIError.isSubscriptionUsagePolicyError(error)) throw error;
+ 		return undefined;
+ 	}
+ }
+diff --git a/packages/ai/src/auth/cascade.ts b/packages/ai/src/auth/cascade.ts
+index 90ab351..4f2096c 100644
+--- a/packages/ai/src/auth/cascade.ts
++++ b/packages/ai/src/auth/cascade.ts
+@@ -28,6 +28,7 @@ import type {
+ 	LimitsApi,
+ 	OAuthCredential,
+ 	OAuthRequestIdentity,
++	SubscriptionCandidatesResult,
+ } from "./types";
+ 
+ type OAuthKeyEncoder = NonNullable<ProviderDefinition["getApiKey"]>;
+@@ -374,6 +375,20 @@ export class KeyCascade implements KeysApi {
+ 		return this.#resolve(provider, sessionId, options);
+ 	}
+ 
++	/**
++	 * List native OAuth candidates for the opt-in subscription-usage policy.
++	 * No key is chosen, no affinity is recorded, and no eligibility is widened.
++	 */
++	async subscriptionCandidates(
++		provider: string,
++		sessionId?: string,
++		options?: AuthApiKeyOptions,
++	): Promise<SubscriptionCandidatesResult> {
++		assertProviderEnabled(provider);
++		if (providerPauseReason(provider) !== undefined) return { supported: false, candidates: [] };
++		return this.#deps.selector.subscriptionCandidates(provider, sessionId, options);
++	}
++
+ 	/**
+ 	 * Get API key for a provider.
+ 	 * Priority (first match wins): runtime override, config override, OAuth,
+diff --git a/packages/ai/src/auth/select.ts b/packages/ai/src/auth/select.ts
+index c18996c..ac828de 100644
+--- a/packages/ai/src/auth/select.ts
++++ b/packages/ai/src/auth/select.ts
+@@ -39,6 +39,8 @@ import {
+ 	type OAuthCredential,
+ 	oauthAccountKey,
+ 	type StoredAuthCredential,
++	type SubscriptionCandidatesResult,
++	type SubscriptionOAuthCandidate,
+ } from "./types";
+ import type { UsageService } from "./usage";
+ import {
+@@ -524,6 +526,95 @@ export class CredentialSelector {
+ 		);
+ 	}
+ 
++	/**
++	 * Native OAuth candidate rows for the opt-in subscription-usage policy.
++	 *
++	 * This deliberately does not choose, rank, pin, or rotate anything. It
++	 * applies the same session restrictions and account allowlist as
++	 * {@link resolveOAuth}, returns every remaining row in native order with its
++	 * raw probe meters, and reports whether the provider has any usage
++	 * attribution at all. Authentication and usage fetches stay bounded by
++	 * `options.signal`.
++	 */
++	async subscriptionCandidates(
++		provider: string,
++		sessionId?: string,
++		options?: AuthApiKeyOptions,
++	): Promise<SubscriptionCandidatesResult> {
++		options?.signal?.throwIfAborted();
++		await this.#deps.pool.adoptExternalChanges();
++		options?.signal?.throwIfAborted();
++		const supported = this.#deps.usage.canFetchOAuthUsage(provider);
++		const entries = this.#deps.pool.entries(provider);
++		const stored = this.#deps.pool
++			.credentials(provider)
++			.map((credential, index) => ({ credential, index }))
++			.filter(
++				(entry): entry is OAuthSelection =>
++					entry.credential.type === "oauth" && this.#deps.affinity.allows(provider, sessionId, entry.credential),
++			);
++		if (stored.length === 0) return { supported, candidates: [] };
++		const providerKey = providerTypeKey(provider, "oauth");
++		const strategy = this.#deps.strategies(provider);
++		const rankingContext: CredentialRankingContext = {
++			modelId: options?.modelId,
++			serviceTier: options?.serviceTier,
++		};
++		const blockScope = strategy?.blockScope?.(rankingContext);
++		const blockScopes = credentialBlockScopesForRequest(strategy, rankingContext, blockScope);
++		const planGate = strategy?.planGate?.(rankingContext);
++		// An explicit session pin is a user decision, not something local policy
++		// may override: only that row is a candidate, even when it is capped.
++		const sessionCredential = this.#deps.affinity.get(provider, sessionId);
++		const explicitPinnedIndex = sessionCredential?.explicit === true ? sessionCredential.index : undefined;
++		const accountIds = options?.accountIds?.length ? new Set(options.accountIds) : undefined;
++		// Mirror resolveOAuth: an allowlist steers only when at least one stored
++		// account matches it; otherwise it would silently empty the pool.
++		const enforceAccounts =
++			accountIds !== undefined &&
++			stored.some(({ credential }) => {
++				const key = oauthAccountKey(credential);
++				return key !== undefined && accountIds.has(key);
++			});
++		const snapshots = await Promise.all(
++			stored.map(async ({ credential, index }) => {
++				if (explicitPinnedIndex !== undefined && index !== explicitPinnedIndex) return undefined;
++				if (enforceAccounts && accountIds !== undefined) {
++					const key = oauthAccountKey(credential);
++					if (key === undefined || !accountIds.has(key)) return undefined;
++				}
++				const snapshot = await this.#deps.usage.subscriptionSnapshot(provider, credential, {
++					baseUrl: options?.baseUrl,
++					modelId: options?.modelId,
++					serviceTier: options?.serviceTier,
++					signal: options?.signal,
++				});
++				if (planGate && snapshot.report && planGate(snapshot.report) === false) return undefined;
++				const credentialId = entries[index]?.id;
++				if (credentialId === undefined) return undefined;
++				const blockedUntil = this.#deps.blocks.blockedUntil(provider, providerKey, index, blockScopes);
++				const sharedGroup = snapshot.meters.find(meter => meter.sharedGroup)?.sharedGroup;
++				const identity = credential.email ?? credential.accountId ?? credential.orgId;
++				const candidate: SubscriptionOAuthCandidate = {
++					credentialId,
++					poolId: sharedGroup ? `${provider}:${sharedGroup}` : `${provider}:credential:${credentialId}`,
++					order: 0,
++					fetchedAt: snapshot.fetchedAt,
++					meters: snapshot.meters,
++					...(blockedUntil !== undefined ? { blockedUntil } : {}),
++					...(identity ? { identity } : {}),
++				};
++				return candidate;
++			}),
++		);
++		const candidates: SubscriptionOAuthCandidate[] = [];
++		for (const candidate of snapshots) {
++			if (!candidate) continue;
++			candidates.push({ ...candidate, order: candidates.length });
++		}
++		return { supported, candidates };
++	}
++
+ 	async #rankOAuthSelections(args: {
+ 		providerKey: string;
+ 		provider: string;
+@@ -690,12 +781,23 @@ export class CredentialSelector {
+ 		);
+ 		// A session restriction drops every other account before ranking, pins,
+ 		// and the fallback passes below, so none of them can route back to it.
+-		const credentials = stored.filter(entry => this.#deps.affinity.allows(provider, sessionId, entry.credential));
++		const credentialIdsByIndex = this.#deps.pool.entries(provider).map(entry => entry.id);
++		const preferredCredentialId = options?.preferredCredentialId;
++		const allowed = stored.filter(entry => this.#deps.affinity.allows(provider, sessionId, entry.credential));
++		// A subscription-usage admission pin narrows the pool to the row that
++		// reserved the background slot. It never widens eligibility: every
++		// restriction, block, plan/tier and validity check below still applies,
++		// and an unavailable pin resolves as no OAuth credential rather than
++		// routing to a sibling.
++		const credentials =
++			preferredCredentialId === undefined
++				? allowed
++				: allowed.filter(entry => credentialIdsByIndex[entry.index] === preferredCredentialId);
+ 
+ 		if (credentials.length === 0) return undefined;
+ 		// Ranking and preflight both await provider work; preserve the row each
+ 		// selection started with even if a peer reorders the live pool.
+-		const credentialIds = this.#deps.pool.entries(provider).map(entry => entry.id);
++		const credentialIds = credentialIdsByIndex;
+ 		this.#deps.policies.validateUsageCapability(provider, this.#deps.usage.canFetchOAuthUsage(provider));
+ 
+ 		const providerKey = providerTypeKey(provider, "oauth");
+diff --git a/packages/ai/src/auth/types.ts b/packages/ai/src/auth/types.ts
+index 89122df..dd066ca 100644
+--- a/packages/ai/src/auth/types.ts
++++ b/packages/ai/src/auth/types.ts
+@@ -536,8 +536,62 @@ export type AuthApiKeyOptions = {
+ 	rejectedAccessToken?: string;
+ 	/** When false, select as `sessionId` would without recording the choice as that session's sticky credential. */
+ 	recordAffinity?: boolean;
++	/**
++	 * Internal subscription-usage admission pin: prefer this durable credential
++	 * row and fail rather than route to a sibling. Every native restriction,
++	 * model/tier eligibility, block and row-validity check still applies; an
++	 * ineligible pin resolves like any other unavailable credential.
++	 */
++	preferredCredentialId?: number;
+ };
+ 
++/** One applicable usage meter on a candidate subscription account. */
++export interface SubscriptionUsageMeter {
++	/** {@link UsageLimit.id}. */
++	id: string;
++	label: string;
++	/** Window duration in milliseconds (300 or 10080 minutes for policy windows). */
++	durationMs: number;
++	/** Absolute reset time in epoch milliseconds. */
++	resetsAt?: number;
++	/** Used fraction `0..1` (`>1` means overage), from the raw probe. */
++	usedFraction?: number;
++	status?: string;
++	/** Upstream quota identity shared by routing-specific copies, when reported. */
++	sharedGroup?: string;
++}
++
++/**
++ * Native candidate row for the opt-in subscription-usage policy.
++ *
++ * Serializable across the auth thread seam: the coding-agent controller owns
++ * the curve math and admission counters, while pi-ai owns credential
++ * eligibility, attribution, and raw usage observations.
++ */
++export interface SubscriptionOAuthCandidate {
++	/** Durable stored credential row id (`auth_credentials.id`). */
++	credentialId: number;
++	/** Quota pool identity; rows sharing one upstream quota share this id. */
++	poolId: string;
++	/** Native candidate order, ascending. */
++	order: number;
++	/** Raw endpoint probe timestamp, or `null` when no trustworthy probe exists. */
++	fetchedAt: number | null;
++	/** Persisted/in-memory cooldown deadline, when the row is blocked. */
++	blockedUntil?: number;
++	/** Applicable meters for the requested model/tier. */
++	meters: SubscriptionUsageMeter[];
++	/** Display-only identity (email/account id); never used for matching. */
++	identity?: string;
++}
++
++/** Result of {@link KeysApi.subscriptionCandidates}. */
++export interface SubscriptionCandidatesResult {
++	/** False when the provider has no native usage attribution path at all. */
++	supported: boolean;
++	candidates: SubscriptionOAuthCandidate[];
++}
++
+ /**
+  * Identity that multi-account discovery records in `Model.accountAccess` and
+  * that {@link AuthApiKeyOptions.accountIds} selection matches: the provider
+@@ -1038,6 +1092,19 @@ export interface KeysApi {
+ 		sessionId?: string,
+ 		options?: AuthApiKeyOptions,
+ 	): Promise<ResolvedApiKey | undefined>;
++	/**
++	 * List native OAuth candidates for the opt-in subscription-usage policy.
++	 *
++	 * Applies the same session restrictions, account allowlists, provider/model
++	 * eligibility and block scopes as request selection, returns each row's raw
++	 * per-credential usage meters, and does not advance round-robin, pin a
++	 * session, or choose a key. Never widens eligibility.
++	 */
++	subscriptionCandidates(
++		provider: string,
++		sessionId?: string,
++		options?: AuthApiKeyOptions,
++	): Promise<SubscriptionCandidatesResult>;
+ 	/**
+ 	 * Peek at API key for a provider without refreshing OAuth tokens.
+ 	 * Used for model discovery where we only need to know if credentials exist
+diff --git a/packages/ai/src/auth/usage.ts b/packages/ai/src/auth/usage.ts
+index 6903fa0..2e842ca 100644
+--- a/packages/ai/src/auth/usage.ts
++++ b/packages/ai/src/auth/usage.ts
+@@ -4,7 +4,7 @@ import { getEnvApiKey } from "../env-api-key";
+ import * as AIError from "../error";
+ import type { OAuthCredentials } from "../registry/oauth/types";
+ import { providerPauseReason } from "../registry/oauth";
+-import type { Provider } from "../types";
++import type { Provider, ServiceTier } from "../types";
+ import { resolveUsedFraction } from "../usage";
+ import type {
+ 	ClientUsageReport,
+@@ -39,7 +39,7 @@ import { mergeRefreshedOrganizationScope, oauthRefreshSkewMs } from "./refresh";
+ import type { OAuthRefresher } from "./refresh";
+ import { USAGE_REPORT_TTL_MS } from "./sqlite-credential-store";
+ import type { AuthCredentialStore } from "./store";
+-import type { AuthCredential, OAuthCredential, ObservedUsageInput, UsageApi } from "./types";
++import type { AuthCredential, OAuthCredential, ObservedUsageInput, SubscriptionUsageMeter, UsageApi } from "./types";
+ import {
+ 	dedupeUsageReports,
+ 	isUsageLimitExhausted,
+@@ -141,6 +141,13 @@ export class UsageService implements UsageApi {
+ 	#usageRequestInFlight: Map<string, { refreshEpoch: number; promise: Promise<UsageReport | null> }> = new Map();
+ 	#usageHeaderIngestAt: Map<string, number> = new Map();
+ 	#usageReportsInFlight: Map<string, Promise<UsageReport[] | null>> = new Map();
++	/**
++	 * Raw, un-merged endpoint probe per credential cache key. `ingestHeaders`
++	 * stamps a merged copy with a new `fetchedAt`, so the opt-in subscription
++	 * policy reads this map instead of the ordinary cache and never treats
++	 * session-affine header telemetry as a fresh quota observation.
++	 */
++	#policyReports: Map<string, UsageReport> = new Map();
+ 	readonly fetch: typeof fetch;
+ 	readonly logger: UsageLogger;
+ 	readonly requestTimeoutMs: number;
+@@ -417,6 +424,9 @@ export class UsageService implements UsageApi {
+ 			// to heal blocks.
+ 			const invalidated = usageCacheEpoch !== this.#deps.cache.epoch;
+ 			if (report !== null) {
++				// Policy reads only raw endpoint probes: remember this one before
++				// any header merge can overwrite the ordinary cache entry.
++				this.#policyReports.set(cacheKey, report);
+ 				if (invalidated) return report;
+ 				this.#deps.blocks.reconcileRequest(request, report);
+ 				const ttlJitter = USAGE_REPORT_TTL_MS * (Math.random() * 0.5 - 0.25);
+@@ -791,7 +801,9 @@ export class UsageService implements UsageApi {
+ 			if (storeHook) {
+ 				const report = await storeHook(provider, credential, options?.signal);
+ 				if (report) {
+-					this.#deps.blocks.reconcileRequest(oauthUsageRequest(provider, credential, options?.baseUrl), report);
++					const request = oauthUsageRequest(provider, credential, options?.baseUrl);
++					this.#deps.blocks.reconcileRequest(request, report);
++					this.#policyReports.set(this.#deps.cache.reportKey(request), report);
+ 				}
+ 				return report;
+ 			}
+@@ -807,6 +819,60 @@ export class UsageService implements UsageApi {
+ 		});
+ 	}
+ 
++	/**
++	 * One credential's raw probe mapped to the meters an opt-in subscription
++	 * policy evaluates. Reads the ordinary cache only to trigger/probe; the
++	 * returned limits and `fetchedAt` come from {@link #policyReports}, so a
++	 * header-merged snapshot can never extend policy freshness. Model scoping
++	 * reuses the provider's reserve strategy and falls back to shared rows plus
++	 * exact model rows, never the ranking helper that treats unknown as 50%.
++	 */
++	async subscriptionSnapshot(
++		provider: Provider,
++		credential: AuthCredential,
++		options?: { baseUrl?: string; modelId?: string; serviceTier?: ServiceTier; signal?: AbortSignal },
++	): Promise<{ fetchedAt: number | null; meters: SubscriptionUsageMeter[]; report: UsageReport | null }> {
++		if (credential.type !== "oauth") return { fetchedAt: null, meters: [], report: null };
++		const request = oauthUsageRequest(provider, credential, options?.baseUrl);
++		await this.report(provider, credential, {
++			baseUrl: options?.baseUrl,
++			signal: options?.signal,
++			timeoutMs: this.requestTimeoutMs,
++		});
++		const raw = this.#policyReports.get(this.#deps.cache.reportKey(request));
++		if (!raw || !Number.isFinite(raw.fetchedAt)) return { fetchedAt: null, meters: [], report: null };
++		const strategy = this.#deps.strategies(provider);
++		const context: CredentialRankingContext = {
++			modelId: options?.modelId,
++			serviceTier: options?.serviceTier,
++		};
++		const limits = strategy
++			? (strategy.scopeLimitsForReserve?.(raw, context) ?? strategy.scopeLimits?.(raw, context) ?? raw.limits)
++			: raw.limits.filter(
++					limit =>
++						limit.scope.shared === true ||
++						(options?.modelId !== undefined && limit.scope.modelId === options.modelId),
++				);
++		const meters: SubscriptionUsageMeter[] = [];
++		for (const limit of limits) {
++			const durationMs = limit.window?.durationMs;
++			if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs <= 0) continue;
++			const usedFraction = resolveUsedFraction(limit) ?? (isUsageLimitExhausted(limit) ? 1 : undefined);
++			if (usedFraction === undefined || !Number.isFinite(usedFraction)) continue;
++			const resetsAt = limit.window?.resetsAt;
++			meters.push({
++				id: limit.id,
++				label: limit.label,
++				durationMs,
++				...(typeof resetsAt === "number" && Number.isFinite(resetsAt) ? { resetsAt } : {}),
++				usedFraction,
++				...(limit.status ? { status: limit.status } : {}),
++				...(limit.scope.sharedGroup ? { sharedGroup: limit.scope.sharedGroup } : {}),
++			});
++		}
++		return { fetchedAt: raw.fetchedAt, meters, report: raw };
++	}
++
+ 	/**
+ 	 * Return model ids whose live reports map to a quantitative usage scope.
+ 	 * Provider strategies supply model/tier mapping when available; otherwise
+diff --git a/packages/ai/src/error/index.ts b/packages/ai/src/error/index.ts
+index eb881d8..2310908 100644
+--- a/packages/ai/src/error/index.ts
++++ b/packages/ai/src/error/index.ts
+@@ -14,3 +14,4 @@ export * from "./provider";
+ export * from "./rate-limit";
+ export * from "./retryable";
+ export * from "./validation";
++export * from "./subscription-usage";
+diff --git a/packages/ai/src/error/subscription-usage.ts b/packages/ai/src/error/subscription-usage.ts
+new file mode 100644
+index 0000000..b660b44
+--- /dev/null
++++ b/packages/ai/src/error/subscription-usage.ts
+@@ -0,0 +1,71 @@
++/**
++ * Local subscription-usage policy denial.
++ *
++ * This is a deliberate, terminal local stop for background/subagent inference:
++ * it is not a provider response, not a missing credential, and must never be
++ * turned into account rotation, model fallback, a provider retry, or a reset
++ * redemption by the auth-retry machinery.
++ */
++export const SUBSCRIPTION_USAGE_POLICY_CLASSIFICATION = "subscription_usage_policy";
++
++export type SubscriptionUsagePolicyReason =
++	| "invalid-config"
++	| "unsupported"
++	| "unknown"
++	| "hard-cap"
++	| "capacity"
++	| "cooldown";
++
++export interface SubscriptionUsagePolicyErrorOptions {
++	/** Window keys (`5h`, `7d`) whose cap/cooldown blocked the request. */
++	blockingWindows?: readonly string[];
++	/** Next moment a fresh observation or reset may make the request admissible. */
++	nextObservationAt?: number;
++	/** Safe human-readable detail (config path/field or a short explanation). */
++	detail?: string;
++}
++
++const REASON_TEXT: Record<SubscriptionUsagePolicyReason, string> = {
++	"invalid-config": "invalid configuration",
++	unsupported: "no usage attribution for this route",
++	unknown: "no trustworthy quota observation",
++	"hard-cap": "hard cap reached",
++	capacity: "background capacity exhausted",
++	cooldown: "provider cooldown",
++};
++
++/** A background request refused by the profile's subscription-usage policy. */
++export class SubscriptionUsagePolicyError extends Error {
++	readonly classification = SUBSCRIPTION_USAGE_POLICY_CLASSIFICATION;
++	readonly provider: string;
++	readonly reason: SubscriptionUsagePolicyReason;
++	readonly blockingWindows?: readonly string[];
++	readonly nextObservationAt?: number;
++	readonly detail?: string;
++
++	constructor(
++		provider: string,
++		reason: SubscriptionUsagePolicyReason,
++		options: SubscriptionUsagePolicyErrorOptions = {},
++	) {
++		const suffix = options.detail ? `; ${options.detail}` : "";
++		super(`Subscription usage policy: ${provider}: ${REASON_TEXT[reason]} (see /subscription-usage)${suffix}`);
++		this.name = "SubscriptionUsagePolicyError";
++		this.provider = provider;
++		this.reason = reason;
++		this.blockingWindows = options.blockingWindows;
++		this.nextObservationAt = options.nextObservationAt;
++		this.detail = options.detail;
++	}
++}
++
++/** True for {@link SubscriptionUsagePolicyError} values, including cross-realm/RPC copies by name. */
++export function isSubscriptionUsagePolicyError(error: unknown): error is SubscriptionUsagePolicyError {
++	if (error instanceof SubscriptionUsagePolicyError) return true;
++	return (
++		typeof error === "object" &&
++		error !== null &&
++		Reflect.get(error, "name") === "SubscriptionUsagePolicyError" &&
++		Reflect.get(error, "classification") === SUBSCRIPTION_USAGE_POLICY_CLASSIFICATION
++	);
++}
+diff --git a/packages/ai/src/index.ts b/packages/ai/src/index.ts
+index 0cd9956..ce24e0e 100644
+--- a/packages/ai/src/index.ts
++++ b/packages/ai/src/index.ts
+@@ -6,6 +6,7 @@ export * from "./auth-gateway/types";
+ export * from "./auth-retry";
+ export * from "./auth-storage";
+ export * from "./error/rate-limit";
++export * from "./error/subscription-usage";
+ export * from "./embeddings";
+ export * from "./images";
+ export * from "./judgment";
+diff --git a/packages/ai/src/stream.ts b/packages/ai/src/stream.ts
+index 16662b9..97e4d22 100644
+--- a/packages/ai/src/stream.ts
++++ b/packages/ai/src/stream.ts
+@@ -857,6 +857,19 @@ function streamSimpleRequest<TApi extends Api>(
+ 			};
+ 			const credential = typeof resolved === "object" ? resolved : undefined;
+ 			const credentialId = credential?.credentialId;
++			// A subscription-usage admission is already held by the resolver that
++			// selected this credential. `reserve` validates that the lease still
++			// belongs to it and returns the idempotent release.
++			const admission = credential?.providerAttemptAdmission;
++			let admissionRelease: (() => Promise<void>) | undefined;
++			let admissionReleased = false;
++			const releaseAdmission = async (): Promise<void> => {
++				if (admissionReleased) return;
++				admissionReleased = true;
++				const release = admissionRelease;
++				admissionRelease = undefined;
++				if (release) await release();
++			};
+ 			// A credential known not to offer the requested tier serves at standard
+ 			// speed; sending the tier anyway would only buy a rejected round trip.
+ 			const withheldTier = credential?.serviceTierUnavailable === true && requestOptions.serviceTier !== undefined;
+@@ -866,6 +879,7 @@ function streamSimpleRequest<TApi extends Api>(
+ 			};
+ 
+ 			try {
++				if (admission) admissionRelease = await admission.reserve(credentialId, requestOptions.signal);
+ 				const attemptOptions = {
+ 					...requestOptions,
+ 					apiKey: resolvedApiKeyBearer(resolved),
+@@ -895,6 +909,8 @@ function streamSimpleRequest<TApi extends Api>(
+ 							event.error.errorMessage,
+ 						)
+ 					) {
++						flushBuffered();
++						await releaseAdmission();
+ 						return {
+ 							error: contextualizeAuthRetryError(model, createAssistantAuthError(event.error)),
+ 							bufferedEvents,
+@@ -904,14 +920,20 @@ function streamSimpleRequest<TApi extends Api>(
+ 					flushBuffered();
+ 					emittedReplayUnsafeEvent = true;
+ 					outer.push(event);
+-					if (outer.done) return undefined;
++					if (outer.done) {
++						await releaseAdmission();
++						return undefined;
++					}
+ 				}
+ 				flushBuffered();
+ 				if (!outer.done) {
+ 					const result = await inner.result();
+ 					if (credentialId !== undefined) result.credentialId = credentialId;
+ 					tagWithheldTier(result);
++					await releaseAdmission();
+ 					outer.end(result);
++				} else {
++					await releaseAdmission();
+ 				}
+ 			} catch (error) {
+ 				if (
+@@ -923,11 +945,14 @@ function streamSimpleRequest<TApi extends Api>(
+ 						error instanceof Error ? error.message : undefined,
+ 					)
+ 				) {
++					await releaseAdmission();
+ 					return { error: contextualizeAuthRetryError(model, error), bufferedEvents };
+ 				}
+ 				flushBuffered();
++				await releaseAdmission();
+ 				outer.fail(error);
+ 			}
++			await releaseAdmission();
+ 			return undefined;
+ 		};
+ 		const emitFailure = (failure: AuthRetryFailure): void => {
+@@ -946,6 +971,12 @@ function streamSimpleRequest<TApi extends Api>(
+ 				initial = await apiKeyResolver({ lastChance: false, error: undefined, signal });
+ 				lastKey = resolvedApiKeyBearer(initial);
+ 			} catch (error) {
++				// A local policy denial is terminal and keeps its classification
++				// instead of being wrapped as missing/configuration auth.
++				if (AIError.isSubscriptionUsagePolicyError(error)) {
++					outer.fail(error);
++					return;
++				}
+ 				// A thrown resolver is a broker/OAuth/network failure, not a missing
+ 				// key — surface the cause instead of masking it as "No API key".
+ 				outer.fail(
+@@ -974,15 +1005,19 @@ function streamSimpleRequest<TApi extends Api>(
+ 				// another doomed request — emit the captured failure instead.
+ 				if (signal?.aborted) break;
+ 				let nextResolved: ApiKeyResolution;
+-				const nextKey = await resolveNextAuthRetryKey(
+-					retryState,
+-					apiKeyResolver,
+-					failure.error,
+-					signal,
+-					resolved => {
++				let nextKey: string | undefined;
++				try {
++					nextKey = await resolveNextAuthRetryKey(retryState, apiKeyResolver, failure.error, signal, resolved => {
+ 						nextResolved = resolved;
+-					},
+-				);
++					});
++				} catch (error) {
++					if (AIError.isSubscriptionUsagePolicyError(error)) {
++						emitFailure(reportedFailure);
++						outer.fail(error);
++						return;
++					}
++					throw error;
++				}
+ 				if (nextKey === undefined) break;
+ 				const next = await runAttempt(nextResolved);
+ 				if (!next) return;
+diff --git a/packages/ai/test/auth-storage-session-restriction.test.ts b/packages/ai/test/auth-storage-session-restriction.test.ts
+index dc302d4..227e661 100644
+--- a/packages/ai/test/auth-storage-session-restriction.test.ts
++++ b/packages/ai/test/auth-storage-session-restriction.test.ts
+@@ -63,6 +63,37 @@ describe("AuthStorage session account restrictions", () => {
+ 		expect(await storage.keys.get(PROVIDER, "parent")).toBe("access-b");
+ 	});
+ 
++	test("pins an admitted credential and lists native candidates without widening eligibility", async () => {
++		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
++		const accounts = storage.oauth.accounts(PROVIDER);
++		const accountB = accounts.find(account => account.accountId === "acc-b");
++		const accountC = accounts.find(account => account.accountId === "acc-c");
++		if (!accountB || !accountC) throw new Error("expected stored accounts");
++
++		const pinned = await storage.keys.getWithCredential(PROVIDER, undefined, {
++			preferredCredentialId: accountB.credentialId,
++			recordAffinity: false,
++		});
++		expect(pinned?.apiKey).toBe("access-b");
++		expect(pinned?.credentialId).toBe(accountB.credentialId);
++
++		// The pin never routes to a sibling: a restricted-away row fails closed.
++		storage.sessions.restrict(PROVIDER, "restricted", ["account:acc-a"]);
++		await expect(
++			storage.keys.getWithCredential(PROVIDER, "restricted", {
++				preferredCredentialId: accountC.credentialId,
++				recordAffinity: false,
++			}),
++		).rejects.toThrow("none of those accounts is available");
++
++		const candidates = await storage.keys.subscriptionCandidates(PROVIDER);
++		expect(candidates.supported).toBe(false);
++		expect(candidates.candidates.map(candidate => candidate.credentialId)).toEqual(
++			accounts.map(account => account.credentialId),
++		);
++		expect(candidates.candidates.every(candidate => candidate.fetchedAt === null)).toBe(true);
++	});
++
+ 	test("skips a runtime key and stored API keys, and fails closed past a config key", async () => {
+ 		await storage.credentials.set(PROVIDER, [oauthCredential("a"), { type: "api_key", key: "stored-key" }]);
+ 		storage.keys.setRuntime(PROVIDER, "runtime-key");
+diff --git a/packages/ai/test/provider-attempt-admission.test.ts b/packages/ai/test/provider-attempt-admission.test.ts
+new file mode 100644
+index 0000000..6c7741c
+--- /dev/null
++++ b/packages/ai/test/provider-attempt-admission.test.ts
+@@ -0,0 +1,161 @@
++import { afterEach, describe, expect, it } from "bun:test";
++import {
++	type ApiKeyResolution,
++	type ApiKeyResolveContext,
++	registerCustomApi,
++	SubscriptionUsagePolicyError,
++	streamSimple,
++	unregisterCustomApis,
++} from "@oh-my-pi/pi-ai";
++import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@oh-my-pi/pi-ai/types";
++import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
++
++const SOURCE_ID = "provider-attempt-admission-test";
++const API = "provider-attempt-admission-test" as Api;
++
++function usage(): Usage {
++	return {
++		input: 0,
++		output: 0,
++		cacheRead: 0,
++		cacheWrite: 0,
++		totalTokens: 0,
++		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
++	};
++}
++
++function assistant(text = "ok"): AssistantMessage {
++	return {
++		role: "assistant",
++		content: [{ type: "text", text }],
++		api: API,
++		provider: "test-provider",
++		model: "test-model",
++		timestamp: 1,
++		stopReason: "stop",
++		usage: usage(),
++	};
++}
++
++function model(): Model<Api> {
++	return {
++		id: "test-model",
++		name: "Test Model",
++		api: API,
++		provider: "test-provider",
++		contextWindow: 1000,
++		maxTokens: 100,
++	} as Model<Api>;
++}
++
++const context: Context = {
++	systemPrompt: [],
++	messages: [{ role: "user", content: "hello", timestamp: 1 }],
++};
++
++function complete(stream: AssistantMessageEventStream): void {
++	const message = assistant();
++	stream.push({ type: "start", partial: message });
++	stream.push({ type: "done", reason: "stop", message });
++}
++
++describe("provider attempt admission", () => {
++	afterEach(() => unregisterCustomApis(SOURCE_ID));
++
++	it("reserves before dispatch and releases before delivering the terminal result", async () => {
++		const events: string[] = [];
++		registerCustomApi(
++			API,
++			(_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
++				events.push(`dispatch:${options?.apiKey}`);
++				const stream = new AssistantMessageEventStream();
++				queueMicrotask(() => complete(stream));
++				return stream;
++			},
++			SOURCE_ID,
++		);
++		const admission = {
++			reserve: async (credentialId: number | undefined) => {
++				events.push(`reserve:${credentialId}`);
++				return async () => {
++					events.push("release");
++				};
++			},
++		};
++		const stream = streamSimple(model(), context, {
++			apiKey: (): ApiKeyResolution => ({ apiKey: "key-1", credentialId: 42, providerAttemptAdmission: admission }),
++		});
++		const result = await stream.result();
++		expect(result.stopReason).toBe("stop");
++		expect(events).toEqual(["reserve:42", "dispatch:key-1", "release"]);
++	});
++
++	it("keeps a local policy denial typed and terminal", async () => {
++		let dispatched = false;
++		registerCustomApi(
++			API,
++			() => {
++				dispatched = true;
++				const stream = new AssistantMessageEventStream();
++				queueMicrotask(() => complete(stream));
++				return stream;
++			},
++			SOURCE_ID,
++		);
++		const denial = new SubscriptionUsagePolicyError("test-provider", "hard-cap");
++		const stream = streamSimple(model(), context, {
++			apiKey: () => {
++				throw denial;
++			},
++		});
++		let failed: unknown;
++		try {
++			await stream.result();
++		} catch (error) {
++			failed = error;
++		}
++		expect(failed).toBeInstanceOf(SubscriptionUsagePolicyError);
++		expect((failed as SubscriptionUsagePolicyError).reason).toBe("hard-cap");
++		expect((failed as Error).message).toContain("Subscription usage policy: test-provider: hard cap reached");
++		expect(dispatched).toBe(false);
++	});
++
++	it("releases each attempt's lease before the next credential is resolved", async () => {
++		const events: string[] = [];
++		let attempts = 0;
++		registerCustomApi(
++			API,
++			(_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
++				attempts++;
++				events.push(`dispatch:${options?.apiKey}`);
++				const stream = new AssistantMessageEventStream();
++				if (attempts === 1) {
++					queueMicrotask(() => stream.fail(Object.assign(new Error("401 denied"), { status: 401 })));
++				} else {
++					queueMicrotask(() => complete(stream));
++				}
++				return stream;
++			},
++			SOURCE_ID,
++		);
++		const resolver = (ctx: ApiKeyResolveContext): ApiKeyResolution => {
++			const credentialId = ctx.error === undefined ? 1 : 2;
++			return {
++				apiKey: `key-${credentialId}`,
++				credentialId,
++				providerAttemptAdmission: {
++					reserve: async (id: number | undefined) => {
++						events.push(`reserve:${id}`);
++						return async () => {
++							events.push(`release:${id}`);
++						};
++					},
++				},
++			};
++		};
++		const stream = streamSimple(model(), context, { apiKey: resolver });
++		const result = await stream.result();
++		expect(result.stopReason).toBe("stop");
++		expect(events).toEqual(["reserve:1", "dispatch:key-1", "release:1", "reserve:2", "dispatch:key-2", "release:2"]);
++	});
++});
+diff --git a/packages/ai/test/subscription-usage-auth.test.ts b/packages/ai/test/subscription-usage-auth.test.ts
+new file mode 100644
+index 0000000..9facbf4
+--- /dev/null
++++ b/packages/ai/test/subscription-usage-auth.test.ts
+@@ -0,0 +1,110 @@
++import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
++import * as fs from "node:fs/promises";
++import * as os from "node:os";
++import * as path from "node:path";
++import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
++import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
++import type { UsageProvider, UsageReport } from "@oh-my-pi/pi-ai/usage";
++
++const PROVIDER = "unit-subscription-usage";
++
++function oauthCredential(suffix: string) {
++	return {
++		type: "oauth" as const,
++		access: `access-${suffix}`,
++		refresh: `refresh-${suffix}`,
++		expires: Date.now() + 60 * 60_000,
++		accountId: `acc-${suffix}`,
++		email: `${suffix}@example.com`,
++	};
++}
++
++function report(now: number): UsageReport {
++	return {
++		provider: PROVIDER,
++		fetchedAt: now,
++		limits: [
++			{
++				id: "5h",
++				label: "5 Hour",
++				scope: { provider: PROVIDER, shared: true },
++				window: { id: "5h", label: "5 Hour", durationMs: 300 * 60_000, resetsAt: now + 2 * 60 * 60_000 },
++				amount: { usedFraction: 0.2, unit: "percent" },
++			},
++			{
++				id: "7d",
++				label: "7 Day",
++				scope: { provider: PROVIDER, shared: true },
++				window: { id: "7d", label: "7 Day", durationMs: 10080 * 60_000, resetsAt: now + 3 * 24 * 60 * 60_000 },
++				amount: { usedFraction: 0.1, unit: "percent" },
++			},
++		],
++	};
++}
++
++describe("AuthStorage subscription candidates", () => {
++	let tempDir = "";
++	let stores: SqliteAuthCredentialStore[] = [];
++	let storage: AuthStorage;
++
++	beforeEach(async () => {
++		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-sub-usage-"));
++		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
++		stores = [store];
++		storage = new AuthStorage(store);
++		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
++			const credential = credentials[provider];
++			return credential ? { newCredentials: credential, apiKey: credential.access } : null;
++		});
++		const usageProvider: UsageProvider = {
++			id: PROVIDER,
++			fetchUsage: async () => report(Date.now()),
++		};
++		storage.usage.setProvider(PROVIDER, usageProvider);
++	});
++
++	afterEach(async () => {
++		vi.restoreAllMocks();
++		for (const store of stores) store.close();
++		await fs.rm(tempDir, { recursive: true, force: true });
++	});
++
++	test("returns per-credential raw meters in native order without choosing a key", async () => {
++		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
++		const accounts = storage.oauth.accounts(PROVIDER);
++		const result = await storage.keys.subscriptionCandidates(PROVIDER, undefined, { modelId: "model-1" });
++		expect(result.supported).toBe(true);
++		expect(result.candidates.map(candidate => candidate.credentialId)).toEqual(
++			accounts.map(account => account.credentialId),
++		);
++		expect(result.candidates.map(candidate => candidate.order)).toEqual([0, 1]);
++		for (const candidate of result.candidates) {
++			expect(candidate.fetchedAt).toBeGreaterThan(0);
++			expect(candidate.meters.map(meter => meter.durationMs)).toEqual([300 * 60_000, 10080 * 60_000]);
++			expect(candidate.meters[0]?.usedFraction).toBe(0.2);
++			expect(candidate.meters[1]?.usedFraction).toBe(0.1);
++		}
++		// Listing is not selecting: no session pin was recorded.
++		expect(storage.sessions.pin(PROVIDER, "s", accounts[0]!.credentialId)).toBe(true);
++	});
++
++	test("narrows candidates to an explicit session pin", async () => {
++		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
++		const accounts = storage.oauth.accounts(PROVIDER);
++		expect(storage.sessions.pin(PROVIDER, "session-pinned", accounts[1]!.credentialId)).toBe(true);
++		const result = await storage.keys.subscriptionCandidates(PROVIDER, "session-pinned", { modelId: "model-1" });
++		expect(result.candidates.map(candidate => candidate.credentialId)).toEqual([accounts[1]!.credentialId]);
++	});
++
++	test("pins the admitted row for request resolution", async () => {
++		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
++		const accounts = storage.oauth.accounts(PROVIDER);
++		const pinned = await storage.keys.getWithCredential(PROVIDER, undefined, {
++			preferredCredentialId: accounts[1]!.credentialId,
++			modelId: "model-1",
++			recordAffinity: false,
++		});
++		expect(pinned?.apiKey).toBe("access-b");
++		expect(pinned?.credentialId).toBe(accounts[1]!.credentialId);
++	});
++});
+diff --git a/packages/coding-agent/src/config/api-key-resolver.ts b/packages/coding-agent/src/config/api-key-resolver.ts
+index ead642c..3debae8 100644
+--- a/packages/coding-agent/src/config/api-key-resolver.ts
++++ b/packages/coding-agent/src/config/api-key-resolver.ts
+@@ -71,10 +71,10 @@ export function createApiKeyResolver(
+ 		provenance.record(resolved);
+ 		return resolved;
+ 	};
+-	return async ({ lastChance, error, signal, previousKey, serviceTier }) => {
++	return async ({ lastChance, error, signal, previousKey, serviceTier, preferredCredentialId }) => {
+ 		const rejectedAccessToken = provenance.accessFor(previousKey);
+ 		if (error === undefined) {
+-			return resolveKey({ serviceTier });
++			return resolveKey({ serviceTier, preferredCredentialId });
+ 		}
+ 		if (lastChance) {
+ 			// Account constraint (401 / usage / account-rate-limit): rotate to a
+diff --git a/packages/coding-agent/src/sdk.ts b/packages/coding-agent/src/sdk.ts
+index 671e8f4..ef8bf90 100644
+--- a/packages/coding-agent/src/sdk.ts
++++ b/packages/coding-agent/src/sdk.ts
+@@ -300,6 +300,11 @@ import type { AgentDefinition } from "./task/types";
+ import { refreshAgentDiscovery } from "./task";
+ import { AgentOutputManager } from "./task/output-manager";
+ import { wrapStreamFnWithProviderConcurrency } from "./task/provider-concurrency";
++import {
++	getSessionSubscriptionUsageController,
++	registerSubscriptionUsageAuthStorage,
++	withSubscriptionUsagePolicy,
++} from "./task/subscription-usage-wiring";
+ import { sessionDelegationBias } from "./task/prompt-policy";
+ import { isScoutSpawnable } from "./task/spawn-policy";
+ import { isMainThread } from "./thread/identity";
+@@ -2580,8 +2585,18 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
+ 	let contextFiles = initialContextFiles;
+ 
+ 	let agent: Agent;
+-	const effectiveGetApiKey =
+-		options.getApiKey ?? (requestModel => modelRegistry.resolver(requestModel, agent.sessionId));
++	registerSubscriptionUsageAuthStorage(agentDir, modelRegistry.authStorage);
++	const baseGetApiKey = options.getApiKey ?? (requestModel => modelRegistry.resolver(requestModel, agent.sessionId));
++	// Only built-in task-subagent inference carries the profile's background
++	// subscription policy. Interactive chat, its side turns and static provider
++	// limits keep their existing behavior.
++	const effectiveGetApiKey: NonNullable<CreateAgentSessionOptions["getApiKey"]> = isSubagentSession
++		? withSubscriptionUsagePolicy(baseGetApiKey, {
++				agentDir,
++				sessionId: () => agent.sessionId,
++				storage: modelRegistry.authStorage,
++			})
++		: baseGetApiKey;
+ 	let session!: AgentSession;
+ 	let hasSession = false;
+ 	let hasRegistered = false;
+@@ -5518,6 +5533,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
+ 		// streamed and parsed on the main thread.
+ 		session = new AgentSession({
+ 			cacheWarmer,
++			subscriptionUsageStatus: async () => {
++				try {
++					return await getSessionSubscriptionUsageController(agentDir, modelRegistry.authStorage).status();
++				} catch (error) {
++					return `Subscription usage policy unavailable: ${error instanceof Error ? error.message : String(error)}`;
++				}
++			},
+ 			costGate: options.costGate,
+ 			advisorWatchdogPrompt,
+ 			advisorContextPrompt,
+diff --git a/packages/coding-agent/src/session/agent-session-types.ts b/packages/coding-agent/src/session/agent-session-types.ts
+index cc1ccd7..74f9ad5 100644
+--- a/packages/coding-agent/src/session/agent-session-types.ts
++++ b/packages/coding-agent/src/session/agent-session-types.ts
+@@ -221,6 +221,8 @@ export interface AgentSessionConfig {
+ 	scoutAllowedBySpawnPolicy?: boolean;
+ 	/** Whether the caller explicitly requested yolo/auto-approve behavior for this session. */
+ 	autoApprove?: boolean;
++	/** Render the profile's subscription-usage policy and live admission state. */
++	subscriptionUsageStatus?: () => Promise<string>;
+ 	/** User-authorized model agents inherited from the parent session for nested delegation. */
+ 	inheritedSessionAgents?: readonly AgentDefinition[];
+ 	/** Models to cycle through with Ctrl+P (from --models flag). */
+diff --git a/packages/coding-agent/src/session/agent-session.ts b/packages/coding-agent/src/session/agent-session.ts
+index b385d8c..3bc9be0 100644
+--- a/packages/coding-agent/src/session/agent-session.ts
++++ b/packages/coding-agent/src/session/agent-session.ts
+@@ -1372,6 +1372,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
+ 	readonly #spawnSignal = isMainThread() ? new SubagentSpawnSignal() : undefined;
+ 	/** Creation-time permission for switchSession to keep the current model when a target's saved model is unrestorable. */
+ 	readonly #allowSessionModelFallback: boolean;
++	readonly #subscriptionUsageStatus: (() => Promise<string>) | undefined;
+ 	readonly #disableModelFallback: boolean;
+ 	/** Creation-time: false when the extension UI context cannot reach a human (ACP without form elicitation). */
+ 	readonly #interactivePrompts: boolean;
+@@ -2275,6 +2276,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
+ 		this.memoryEnabled = config.memoryEnabled ?? true;
+ 		this.#modelRegistry = config.modelRegistry;
+ 		this.#allowSessionModelFallback = config.allowSessionModelFallback === true;
++		this.#subscriptionUsageStatus = config.subscriptionUsageStatus;
+ 		this.#disableModelFallback = config.disableModelFallback === true;
+ 		this.#interactivePrompts = config.interactivePrompts !== false;
+ 		this.#extensionRoots =
+@@ -17106,6 +17108,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
+ 	/**
+ 	 * Format a concise advisor status line for ACP/text output.
+ 	 */
++	/** Plain-text subscription-usage policy status (`/subscription-usage`). */
++	subscriptionUsageStatus(): Promise<string> {
++		if (!this.#subscriptionUsageStatus) {
++			return Promise.resolve("Subscription usage policy is not available in this session.");
++		}
++		return this.#subscriptionUsageStatus();
++	}
++
+ 	formatAdvisorStatus(): string {
+ 		return this.#advisors.formatAdvisorStatus();
+ 	}
+diff --git a/packages/coding-agent/src/slash-commands/builtin-session.ts b/packages/coding-agent/src/slash-commands/builtin-session.ts
+index 85849c7..52b7596 100644
+--- a/packages/coding-agent/src/slash-commands/builtin-session.ts
++++ b/packages/coding-agent/src/slash-commands/builtin-session.ts
+@@ -455,6 +455,25 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
+ 			clearSubmittedText(runtime);
+ 		},
+ 	},
++	{
++		name: "subscription-usage",
++		icon: "gauge",
++		description: "Show the subscription usage policy and background admission",
++		allowArgs: true,
++		handle: async (command, runtime) => {
++			if (command.args.trim()) return usage("Usage: /subscription-usage", runtime);
++			await runtime.output(await runtime.session.subscriptionUsageStatus());
++			return commandConsumed();
++		},
++		handleTui: async (command, runtime) => {
++			if (command.args.trim()) {
++				runtime.ctx.showStatus("Usage: /subscription-usage");
++			} else {
++				runtime.ctx.showStatus(await runtime.ctx.session.subscriptionUsageStatus());
++			}
++			clearSubmittedText(runtime);
++		},
++	},
+ 	{
+ 		name: "stats",
+ 		icon: "stats",
+diff --git a/packages/coding-agent/src/task/subscription-usage-controller.ts b/packages/coding-agent/src/task/subscription-usage-controller.ts
+new file mode 100644
+index 0000000..ebb0203
+--- /dev/null
++++ b/packages/coding-agent/src/task/subscription-usage-controller.ts
+@@ -0,0 +1,573 @@
++import { SubscriptionUsagePolicyError, type ServiceTier, type SubscriptionUsagePolicyReason } from "@oh-my-pi/pi-ai";
++import {
++	curveFor,
++	evaluateCurve,
++	type PolicyLoad,
++	type ProviderPolicy,
++	type SubscriptionUsagePolicy,
++} from "./subscription-usage";
++
++export interface SubscriptionMeterSnapshot {
++	id: string;
++	label: string;
++	/** 300*60_000 for the 5h window, 10080*60_000 for weekly. */
++	durationMs: number;
++	resetsAt?: number;
++	usedFraction?: number;
++	status?: string;
++}
++
++export interface SubscriptionCandidateSnapshot {
++	credentialId: number;
++	poolId: string;
++	order: number;
++	fetchedAt: number | null;
++	blockedUntil?: number;
++	meters: SubscriptionMeterSnapshot[];
++	identity?: string;
++}
++
++export interface SubscriptionCandidateRequest {
++	provider: string;
++	modelId?: string;
++	baseUrl?: string;
++	serviceTier?: ServiceTier;
++	sessionId?: string;
++	accountIds?: readonly string[];
++	signal?: AbortSignal;
++}
++
++export interface SubscriptionCandidatesSource {
++	candidates(request: SubscriptionCandidateRequest): Promise<{
++		supported: boolean;
++		candidates: readonly SubscriptionCandidateSnapshot[];
++	}>;
++}
++
++export interface SubscriptionUsageControllerOptions {
++	agentDir: string;
++	policy: PolicyLoad;
++	source: SubscriptionCandidatesSource;
++	now?: () => number;
++	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
++	freshMs?: number;
++	pollMs?: number;
++}
++
++const FIVE_HOUR_MINUTES = 300;
++const WEEKLY_MINUTES = 10080;
++const FIVE_HOUR_MS = FIVE_HOUR_MINUTES * 60_000;
++const WEEKLY_MS = WEEKLY_MINUTES * 60_000;
++const DEFAULT_FRESH_MS = 375_000;
++const DEFAULT_POLL_MS = 15_000;
++
++type WindowKey = "fiveHour" | "weekly";
++
++interface MeterEvaluation {
++	meter: SubscriptionMeterSnapshot;
++	window?: WindowKey;
++	usedPercent?: number;
++	softPercent?: number;
++	hardPercent?: number;
++	resetsInMs?: number;
++}
++
++interface CandidateEvaluation {
++	snapshot: SubscriptionCandidateSnapshot;
++	valid: boolean;
++	blocked: boolean;
++	hasExhaustedMeter: boolean;
++	hardCapped: boolean;
++	underSoft: boolean;
++	headroom?: number;
++	remaining?: number;
++	ownCeiling: number;
++	meters: MeterEvaluation[];
++}
++
++interface CapacityEvaluation {
++	poolCapacities: Map<string, number>;
++	providerCeiling: number;
++}
++
++function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
++	return new Promise((resolve, reject) => {
++		if (signal?.aborted) {
++			reject(signal ? abortReason(signal) : new DOMException("The operation was aborted", "AbortError"));
++			return;
++		}
++		const timer = setTimeout(
++			() => {
++				signal?.removeEventListener("abort", onAbort);
++				resolve();
++			},
++			Math.max(0, ms),
++		);
++		const onAbort = () => {
++			clearTimeout(timer);
++			signal?.removeEventListener("abort", onAbort);
++			reject(signal ? abortReason(signal) : new DOMException("The operation was aborted", "AbortError"));
++		};
++		signal?.addEventListener("abort", onAbort, { once: true });
++	});
++}
++
++function abortReason(signal: AbortSignal): unknown {
++	return signal.reason ?? new DOMException("The operation was aborted", "AbortError");
++}
++
++function throwIfAborted(signal?: AbortSignal): void {
++	if (signal?.aborted) throw abortReason(signal);
++}
++
++function clamp(value: number, min: number, max: number): number {
++	return Math.min(max, Math.max(min, value));
++}
++
++function isFiniteNumber(value: unknown): value is number {
++	return typeof value === "number" && Number.isFinite(value);
++}
++
++function windowForDuration(durationMs: number): { window: WindowKey; minutes: number } | undefined {
++	if (durationMs === FIVE_HOUR_MS) return { window: "fiveHour", minutes: FIVE_HOUR_MINUTES };
++	if (durationMs === WEEKLY_MS) return { window: "weekly", minutes: WEEKLY_MINUTES };
++	return undefined;
++}
++
++function evaluateCandidates(
++	policy: ProviderPolicy,
++	candidates: readonly SubscriptionCandidateSnapshot[],
++	now: number,
++	freshMs: number,
++): CandidateEvaluation[] {
++	return candidates.map(snapshot => {
++		const evaluation: CandidateEvaluation = {
++			snapshot,
++			valid: false,
++			blocked: snapshot.blockedUntil !== undefined && snapshot.blockedUntil > now,
++			hasExhaustedMeter: snapshot.meters.some(meter => meter.status === "exhausted"),
++			hardCapped: false,
++			underSoft: true,
++			ownCeiling: 0,
++			meters: [],
++		};
++		const fetchedAt = snapshot.fetchedAt;
++		const fresh = isFiniteNumber(fetchedAt) && now - fetchedAt >= 0 && now - fetchedAt <= freshMs;
++		let hasFiveHour = false;
++		let hasWeekly = false;
++		let complete = true;
++		let headroom = Number.POSITIVE_INFINITY;
++		let softRemaining = Number.POSITIVE_INFINITY;
++		let hasSoft = false;
++		let remaining = Number.POSITIVE_INFINITY;
++		let hardCapped = evaluation.hasExhaustedMeter;
++
++		for (const meter of snapshot.meters) {
++			const duration = windowForDuration(meter.durationMs);
++			const result: MeterEvaluation = { meter };
++			evaluation.meters.push(result);
++			if (!duration) continue;
++			result.window = duration.window;
++			const reset = meter.resetsAt;
++			if (isFiniteNumber(reset)) result.resetsInMs = reset - now;
++			const futureReset = isFiniteNumber(reset) && reset > now;
++			if (futureReset) {
++				if (duration.window === "fiveHour") hasFiveHour = true;
++				else hasWeekly = true;
++			}
++
++			const usedFraction = meter.usedFraction;
++			const usedPercent =
++				isFiniteNumber(usedFraction) && usedFraction >= 0 && Number.isFinite(usedFraction * 100)
++					? usedFraction * 100
++					: undefined;
++			if (usedPercent === undefined) {
++				if (futureReset) complete = false;
++			} else {
++				result.usedPercent = usedPercent;
++			}
++			if (!isFiniteNumber(reset)) continue;
++			const curve = curveFor(policy, duration.window, snapshot.credentialId);
++			const remainingMinutes = clamp((reset - now) / 60_000, 0, duration.minutes);
++			const values = evaluateCurve(curve, remainingMinutes);
++			if (!values) {
++				if (futureReset) complete = false;
++				continue;
++			}
++			result.hardPercent = values.hardPercent;
++			result.softPercent = values.softPercent;
++			if (!futureReset || usedPercent === undefined) continue;
++			headroom = Math.min(headroom, values.hardPercent - usedPercent);
++			remaining = Math.min(remaining, 100 - usedPercent);
++			if (values.softPercent !== undefined) {
++				softRemaining = Math.min(softRemaining, values.softPercent - usedPercent);
++				hasSoft = true;
++			}
++			if (usedPercent >= 100 || meter.status === "exhausted") hardCapped = true;
++		}
++
++		if (
++			!fresh ||
++			!hasFiveHour ||
++			!hasWeekly ||
++			!complete ||
++			!Number.isFinite(headroom) ||
++			!Number.isFinite(remaining)
++		)
++			return evaluation;
++		evaluation.valid = true;
++		evaluation.underSoft = !hasSoft || softRemaining > 0;
++		evaluation.headroom = headroom;
++		evaluation.remaining = remaining;
++		evaluation.hardCapped = hardCapped || headroom <= 0;
++		return evaluation;
++	});
++}
++
++function evaluateCapacities(policy: ProviderPolicy, candidates: CandidateEvaluation[]): CapacityEvaluation {
++	// Rows sharing one upstream quota pool contribute that pool once, and the
++	// smallest row capacity wins: the pool has one real concurrency budget, and
++	// the least-headroom observation is the conservative view of it.
++	const capacityByPool = new Map<string, number>();
++	for (const candidate of candidates) {
++		if (!candidate.valid || candidate.headroom === undefined) continue;
++		const headroom = clamp(candidate.headroom, 0, 100);
++		const capacity = Math.ceil((policy.maxInFlight * headroom) / 100);
++		candidate.ownCeiling = capacity;
++		const previous = capacityByPool.get(candidate.snapshot.poolId);
++		if (previous === undefined || capacity < previous) capacityByPool.set(candidate.snapshot.poolId, capacity);
++	}
++
++	let totalCapacity = 0;
++	for (const capacity of capacityByPool.values()) totalCapacity += capacity;
++	return {
++		poolCapacities: capacityByPool,
++		providerCeiling: Math.min(policy.maxInFlight, totalCapacity),
++	};
++}
++
++function sanitizeText(value: string): string {
++	return value.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
++}
++
++function formatPercent(value: number | undefined): string {
++	return isFiniteNumber(value) ? `${value.toFixed(1)}%` : "unknown";
++}
++
++function formatCountdown(ms: number | undefined): string {
++	if (!isFiniteNumber(ms)) return "unknown";
++	if (ms <= 0) return "expired";
++	let seconds = Math.ceil(ms / 1000);
++	const days = Math.floor(seconds / 86_400);
++	seconds -= days * 86_400;
++	const hours = Math.floor(seconds / 3_600);
++	seconds -= hours * 3_600;
++	const minutes = Math.floor(seconds / 60);
++	seconds -= minutes * 60;
++	if (days) return `${days}d ${hours}h`;
++	if (hours) return `${hours}h ${minutes}m`;
++	if (minutes) return `${minutes}m ${seconds}s`;
++	return `${seconds}s`;
++}
++
++function displayWindow(window: WindowKey | undefined, durationMs: number): string {
++	if (window === "fiveHour") return "5h";
++	if (window === "weekly") return "7d";
++	return `${Math.round(durationMs / 60_000)}m`;
++}
++
++export class SubscriptionUsageController {
++	private readonly now: () => number;
++	private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
++	private readonly freshMs: number;
++	private readonly pollMs: number;
++	private readonly runningByProvider = new Map<string, number>();
++	private readonly runningByPool = new Map<string, Map<string, number>>();
++	private readonly waitingByProvider = new Map<string, number>();
++	private readonly leases = new Map<number, { provider: string; poolId: string }>();
++	private readonly waiters = new Set<() => void>();
++	private nextLeaseId = 1;
++	private wakeVersion = 0;
++
++	constructor(private readonly options: SubscriptionUsageControllerOptions) {
++		this.now = options.now ?? Date.now;
++		this.sleep = options.sleep ?? defaultSleep;
++		this.freshMs = options.freshMs ?? DEFAULT_FRESH_MS;
++		this.pollMs = options.pollMs ?? DEFAULT_POLL_MS;
++	}
++
++	async admit(
++		request: SubscriptionCandidateRequest,
++	): Promise<{ status: "admitted"; credentialId: number; leaseId: number } | { status: "unconfigured" }> {
++		const { policy } = this.options;
++		if (policy.status === "disabled") return { status: "unconfigured" };
++		if (policy.status === "error") {
++			throw this.policyError(request.provider, "invalid-config", `${policy.path}: ${policy.message}`);
++		}
++		const providerPolicy = policy.policy.providers[request.provider];
++		if (!providerPolicy) return { status: "unconfigured" };
++
++		let waiting = false;
++		let deadline: number | undefined;
++		let lastEvaluation: CandidateEvaluation[] = [];
++		try {
++			for (;;) {
++				throwIfAborted(request.signal);
++				const observedWakeVersion = this.wakeVersion;
++				const result = await this.options.source.candidates(request);
++				throwIfAborted(request.signal);
++				if (!result.supported) {
++					throw this.policyError(
++						request.provider,
++						"unsupported",
++						"Subscription usage is not supported for this request.",
++					);
++				}
++				if (result.candidates.length === 0) {
++					throw this.policyError(request.provider, "unknown", "No subscription accounts are available.");
++				}
++
++				const now = this.now();
++				lastEvaluation = evaluateCandidates(
++					policy.policy.providers[request.provider],
++					result.candidates,
++					now,
++					this.freshMs,
++				);
++				const capacities = evaluateCapacities(providerPolicy, lastEvaluation);
++				const selection = this.selectCandidate(request.provider, lastEvaluation, capacities);
++				if (selection) {
++					if (waiting) this.adjustWaiting(request.provider, -1);
++					const leaseId = this.nextLeaseId++;
++					this.leases.set(leaseId, { provider: request.provider, poolId: selection.snapshot.poolId });
++					this.adjustRunning(request.provider, selection.snapshot.poolId, 1);
++					return { status: "admitted", credentialId: selection.snapshot.credentialId, leaseId };
++				}
++
++				if (!waiting) {
++					deadline = now + providerPolicy.maxWaitMs;
++					if (providerPolicy.maxWaitMs === 0) throw this.denialError(request.provider, lastEvaluation, now);
++					waiting = true;
++					this.adjustWaiting(request.provider, 1);
++				}
++				if (this.now() >= deadline!) throw this.denialError(request.provider, lastEvaluation, this.now());
++				if (observedWakeVersion !== this.wakeVersion) continue;
++				const waitMs = Math.max(1, Math.min(this.pollMs, deadline! - this.now()));
++				await this.waitForChange(waitMs, request.signal, observedWakeVersion);
++			}
++		} finally {
++			if (waiting) this.adjustWaiting(request.provider, -1);
++		}
++	}
++
++	async release(leaseId: number): Promise<void> {
++		const lease = this.leases.get(leaseId);
++		if (lease) {
++			this.leases.delete(leaseId);
++			this.adjustRunning(lease.provider, lease.poolId, -1);
++		}
++		this.wakeWaiters();
++	}
++
++	async status(): Promise<string> {
++		const { policy } = this.options;
++		const lines = [`Subscription usage policy: ${sanitizeText(policy.path)}`];
++		if (policy.status === "disabled") {
++			lines.push("The policy file is absent; subscription usage limits are disabled.");
++			lines.push("Example: configure providers.<provider>.maxInFlight and windows.5h/windows.7d in this file.");
++			lines.push("Restart OMP after editing.");
++			return lines.join("\n");
++		}
++		if (policy.status === "error") {
++			lines.push(`Configuration error: ${sanitizeText(policy.message)}`);
++			lines.push("Restart OMP after editing.");
++			return lines.join("\n");
++		}
++
++		const policyDocument: SubscriptionUsagePolicy = policy.policy;
++		for (const [providerId, providerPolicy] of Object.entries(policyDocument.providers)) {
++			const provider = sanitizeText(providerId);
++			const running = this.runningByProvider.get(providerId) ?? 0;
++			const waiting = this.waitingByProvider.get(providerId) ?? 0;
++			let candidates: readonly SubscriptionCandidateSnapshot[] = [];
++			let sourceStatus: "ready" | "unsupported" | "error" = "ready";
++			try {
++				const result = await this.options.source.candidates({ provider: providerId });
++				if (!result.supported) sourceStatus = "unsupported";
++				else candidates = result.candidates;
++			} catch {
++				sourceStatus = "error";
++			}
++			const evaluated = evaluateCandidates(providerPolicy, candidates, this.now(), this.freshMs);
++			const capacities = evaluateCapacities(providerPolicy, evaluated);
++			lines.push(
++				`Provider ${provider}: running=${running}/${capacities.providerCeiling} (max=${providerPolicy.maxInFlight}), waiting=${waiting}`,
++			);
++			if (sourceStatus !== "ready") {
++				lines.push(
++					`  candidates: ${sourceStatus === "unsupported" ? "unsupported route" : "source unavailable"} (unknown)`,
++				);
++				continue;
++			}
++			if (evaluated.length === 0) {
++				lines.push("  candidates: none (unknown)");
++				continue;
++			}
++			for (const candidate of evaluated) {
++				const state = this.candidateStatus(providerId, candidate, capacities);
++				const identity = candidate.snapshot.identity
++					? ` identity=${JSON.stringify(sanitizeText(candidate.snapshot.identity))}`
++					: "";
++				lines.push(`  credential:${candidate.snapshot.credentialId} ${state}${identity}`);
++				for (const meter of candidate.meters) {
++					const label = sanitizeText(meter.meter.label || meter.meter.id);
++					lines.push(
++						`    ${displayWindow(meter.window, meter.meter.durationMs)} ${label}: used=${formatPercent(meter.usedPercent)}, soft=${formatPercent(meter.softPercent)}, hard=${formatPercent(meter.hardPercent)}, reset=${formatCountdown(meter.resetsInMs)}`,
++					);
++				}
++			}
++		}
++		lines.push("Restart OMP after editing.");
++		return lines.join("\n");
++	}
++
++	private selectCandidate(
++		provider: string,
++		candidates: CandidateEvaluation[],
++		capacities: CapacityEvaluation,
++	): CandidateEvaluation | undefined {
++		const providerRunning = this.runningByProvider.get(provider) ?? 0;
++		if (providerRunning >= capacities.providerCeiling) return undefined;
++		const available = candidates.filter(candidate => {
++			if (!candidate.valid || candidate.blocked || candidate.hardCapped) return false;
++			const poolCapacity = capacities.poolCapacities.get(candidate.snapshot.poolId) ?? 0;
++			const poolRunning = this.runningByPool.get(provider)?.get(candidate.snapshot.poolId) ?? 0;
++			return poolRunning < poolCapacity && poolRunning < candidate.ownCeiling;
++		});
++		const preferred = available.filter(candidate => candidate.underSoft);
++		const choices = preferred.length > 0 ? preferred : available;
++		choices.sort((left, right) => {
++			const headroom = (right.headroom ?? Number.NEGATIVE_INFINITY) - (left.headroom ?? Number.NEGATIVE_INFINITY);
++			if (headroom !== 0) return headroom;
++			const remaining = (right.remaining ?? Number.NEGATIVE_INFINITY) - (left.remaining ?? Number.NEGATIVE_INFINITY);
++			if (remaining !== 0) return remaining;
++			return left.snapshot.order - right.snapshot.order;
++		});
++		return choices[0];
++	}
++
++	private candidateStatus(provider: string, candidate: CandidateEvaluation, capacities: CapacityEvaluation): string {
++		if (candidate.blocked) return "cooldown";
++		if (!candidate.valid) return "unknown";
++		if (candidate.hardCapped) return "hard capped";
++		const running = this.runningByProvider.get(provider) ?? 0;
++		const poolRunning = this.runningByPool.get(provider)?.get(candidate.snapshot.poolId) ?? 0;
++		const poolCapacity = capacities.poolCapacities.get(candidate.snapshot.poolId) ?? 0;
++		if (running >= capacities.providerCeiling || poolRunning >= poolCapacity || poolRunning >= candidate.ownCeiling) {
++			return "capacity";
++		}
++		return candidate.underSoft ? "preferred" : "soft fallback";
++	}
++
++	private denialError(provider: string, candidates: CandidateEvaluation[], now: number): SubscriptionUsagePolicyError {
++		let reason: SubscriptionUsagePolicyReason = "unknown";
++		if (candidates.some(candidate => candidate.blocked)) {
++			reason = "cooldown";
++		} else if (
++			candidates.some(
++				candidate =>
++					candidate.hasExhaustedMeter ||
++					(candidate.valid && candidate.headroom !== undefined && candidate.headroom <= 0),
++			)
++		) {
++			reason = "hard-cap";
++		} else if (candidates.some(candidate => candidate.valid)) {
++			reason = "capacity";
++		}
++		const nextObservationAt =
++			reason === "cooldown"
++				? candidates.reduce<number | undefined>((next, candidate) => {
++						const blockedUntil = candidate.snapshot.blockedUntil;
++						if (!isFiniteNumber(blockedUntil) || blockedUntil <= now) return next;
++						return next === undefined ? blockedUntil : Math.min(next, blockedUntil);
++					}, undefined)
++				: undefined;
++		return this.policyError(provider, reason, undefined, nextObservationAt);
++	}
++
++	private policyError(
++		provider: string,
++		reason: SubscriptionUsagePolicyReason,
++		detail?: string,
++		nextObservationAt?: number,
++	): SubscriptionUsagePolicyError {
++		return new SubscriptionUsagePolicyError(provider, reason, {
++			detail,
++			nextObservationAt,
++		});
++	}
++
++	private adjustRunning(provider: string, poolId: string, amount: number): void {
++		const providerCount = (this.runningByProvider.get(provider) ?? 0) + amount;
++		if (providerCount === 0) this.runningByProvider.delete(provider);
++		else this.runningByProvider.set(provider, providerCount);
++		let pools = this.runningByPool.get(provider);
++		if (!pools) {
++			pools = new Map();
++			this.runningByPool.set(provider, pools);
++		}
++		const poolCount = (pools.get(poolId) ?? 0) + amount;
++		if (poolCount === 0) pools.delete(poolId);
++		else pools.set(poolId, poolCount);
++		if (pools.size === 0) this.runningByPool.delete(provider);
++	}
++
++	private adjustWaiting(provider: string, amount: number): void {
++		const count = (this.waitingByProvider.get(provider) ?? 0) + amount;
++		if (count <= 0) this.waitingByProvider.delete(provider);
++		else this.waitingByProvider.set(provider, count);
++	}
++
++	private wakeWaiters(): void {
++		this.wakeVersion++;
++		for (const wake of this.waiters) wake();
++	}
++
++	private waitForChange(ms: number, signal: AbortSignal | undefined, observedWakeVersion: number): Promise<void> {
++		if (signal?.aborted)
++			return Promise.reject(
++				signal ? abortReason(signal) : new DOMException("The operation was aborted", "AbortError"),
++			);
++		if (observedWakeVersion !== this.wakeVersion) return Promise.resolve();
++		return new Promise((resolve, reject) => {
++			let settled = false;
++			const timerAbort = new AbortController();
++			const cleanup = () => {
++				this.waiters.delete(onWake);
++				signal?.removeEventListener("abort", onAbort);
++				timerAbort.abort();
++			};
++			const finish = (error?: unknown) => {
++				if (settled) return;
++				settled = true;
++				cleanup();
++				if (error !== undefined) reject(error);
++				else resolve();
++			};
++			const onWake = () => finish();
++			const onAbort = () => finish(abortReason(signal!));
++			this.waiters.add(onWake);
++			signal?.addEventListener("abort", onAbort, { once: true });
++			if (signal?.aborted) {
++				finish(abortReason(signal));
++				return;
++			}
++			void this.sleep(ms, timerAbort.signal).then(
++				() => finish(),
++				error => {
++					if (!timerAbort.signal.aborted) finish(error);
++				},
++			);
++		});
++	}
++}
+diff --git a/packages/coding-agent/src/task/subscription-usage-wiring.ts b/packages/coding-agent/src/task/subscription-usage-wiring.ts
+new file mode 100644
+index 0000000..08e8995
+--- /dev/null
++++ b/packages/coding-agent/src/task/subscription-usage-wiring.ts
+@@ -0,0 +1,227 @@
++/**
++ * Opt-in subscription-usage admission for subagent inference.
++ *
++ * The profile's `subscription-usage.yml` shapes two quota windows into hard and
++ * soft caps and caps background concurrency. This module is the coding-agent
++ * seam: it resolves the profile controller (local on main, bridged in a worker
++ * thread), pins the admitted durable credential for the native auth resolver,
++ * and carries the lease into the streaming attempt so it is released exactly
++ * once at that attempt's terminal boundary.
++ *
++ * Interactive chat never reaches this wrapper; only sessions with
++ * `taskDepth > 0` / `parentTaskPrefix` wrap their resolver.
++ */
++import type { AgentOptions } from "@oh-my-pi/pi-agent-core";
++import {
++	type ApiKey,
++	type ApiKeyResolver,
++	type AuthStorage,
++	isApiKeyResolver,
++	type ResolvedApiKey,
++	SubscriptionUsagePolicyError,
++} from "@oh-my-pi/pi-ai";
++import { getAgentDir } from "@oh-my-pi/pi-utils";
++import { isMainThread } from "../thread/identity";
++import { loadSubscriptionUsagePolicy } from "./subscription-usage";
++import {
++	SubscriptionUsageController,
++	type SubscriptionCandidateRequest,
++	type SubscriptionCandidateSnapshot,
++	type SubscriptionCandidatesSource,
++} from "./subscription-usage-controller";
++
++/** Outcome of one admission decision, shared with the worker bridge. */
++export type SubscriptionAdmitResult =
++	| { status: "admitted"; credentialId: number; leaseId: number }
++	| { status: "unconfigured" };
++
++/** Controller surface shared by the main-thread instance and the worker proxy. */
++export interface SubscriptionUsageControllerLike {
++	admit(request: SubscriptionCandidateRequest): Promise<SubscriptionAdmitResult>;
++	release(leaseId: number): Promise<void>;
++	status(): Promise<string>;
++}
++
++const controllers = new Map<string, SubscriptionUsageControllerLike>();
++const storages = new Map<string, AuthStorage>();
++let remoteController: SubscriptionUsageControllerLike | undefined;
++
++/** Worker thread: install the controller proxy booted by the thread service. */
++export function setRemoteSubscriptionUsageController(controller: SubscriptionUsageControllerLike | undefined): void {
++	remoteController = controller;
++}
++
++/** Remember the profile's auth storage so a worker bridge can evaluate the same pool. */
++export function registerSubscriptionUsageAuthStorage(agentDir: string, storage: AuthStorage): void {
++	storages.set(agentDir, storage);
++	// Read the policy once at profile startup (first session construction) rather
++	// than on the first background request. A malformed file is retained as an
++	// explicit configuration error; interactive sessions still start.
++	if (isMainThread() && !controllers.has(agentDir)) getMainSubscriptionUsageController(agentDir, storage);
++}
++
++/** Auth-storage-backed candidate source (main thread only). */
++class AuthStorageSubscriptionSource implements SubscriptionCandidatesSource {
++	readonly #storage: AuthStorage;
++
++	constructor(storage: AuthStorage) {
++		this.#storage = storage;
++	}
++
++	async candidates(
++		request: SubscriptionCandidateRequest,
++	): Promise<{ supported: boolean; candidates: readonly SubscriptionCandidateSnapshot[] }> {
++		const result = await this.#storage.keys.subscriptionCandidates(request.provider, request.sessionId, {
++			baseUrl: request.baseUrl,
++			modelId: request.modelId,
++			serviceTier: request.serviceTier,
++			accountIds: request.accountIds,
++			signal: request.signal,
++		});
++		return { supported: result.supported, candidates: result.candidates };
++	}
++}
++
++/** Main thread: one controller per profile root, policy read once. */
++export function getMainSubscriptionUsageController(
++	agentDir: string,
++	storage?: AuthStorage,
++): SubscriptionUsageControllerLike {
++	let controller = controllers.get(agentDir);
++	if (controller) return controller;
++	const known = storage ?? storages.get(agentDir);
++	if (!known) throw new Error(`Subscription usage policy: no auth storage registered for ${agentDir}`);
++	storages.set(agentDir, known);
++	controller = new SubscriptionUsageController({
++		agentDir,
++		policy: loadSubscriptionUsagePolicy(agentDir),
++		source: new AuthStorageSubscriptionSource(known),
++	});
++	controllers.set(agentDir, controller);
++	return controller;
++}
++
++/** The controller this session's resolver must use. */
++export function getSessionSubscriptionUsageController(
++	agentDir: string,
++	storage?: AuthStorage,
++): SubscriptionUsageControllerLike {
++	if (!isMainThread()) {
++		if (!remoteController) throw new Error("Subscription usage policy: worker controller bridge is not booted");
++		return remoteController;
++	}
++	return getMainSubscriptionUsageController(agentDir, storage);
++}
++
++/** Test seam: install a fake controller for one profile root. */
++export function setSubscriptionUsageControllerForTesting(
++	agentDir: string,
++	controller: SubscriptionUsageControllerLike | undefined,
++): void {
++	if (controller) controllers.set(agentDir, controller);
++	else controllers.delete(agentDir);
++}
++
++/** Test seam: drop cached controllers/policies/storage registrations. */
++export function resetSubscriptionUsageControllersForTesting(): void {
++	controllers.clear();
++	storages.clear();
++	remoteController = undefined;
++}
++
++function wrapResolver(
++	resolver: ApiKeyResolver,
++	model: Parameters<NonNullable<AgentOptions["getApiKey"]>>[0],
++	agentDir: string,
++	sessionId: string | undefined,
++	storage: AuthStorage | undefined,
++): ApiKeyResolver {
++	const provider = model.provider;
++	return async ctx => {
++		// Provider-driven refresh/rotation after a genuine failure uses the
++		// native recovery path unchanged. The failed attempt already released
++		// its lease; this retry must not be pinned to the now-failed row.
++		if (ctx.error !== undefined) return resolver(ctx);
++		const controller = getSessionSubscriptionUsageController(agentDir, storage);
++		const admitted = await controller.admit({
++			provider,
++			modelId: model.id,
++			baseUrl: model.baseUrl,
++			serviceTier: ctx.serviceTier,
++			sessionId,
++			...(model.accountAccess ? { accountIds: Object.keys(model.accountAccess) } : {}),
++			signal: ctx.signal,
++		});
++		if (admitted.status === "unconfigured") return resolver(ctx);
++		const leaseId = admitted.leaseId;
++		let released = false;
++		const onAbort = () => {
++			void release();
++		};
++		const release = async (): Promise<void> => {
++			if (released) return;
++			released = true;
++			ctx.signal?.removeEventListener("abort", onAbort);
++			await controller.release(leaseId);
++		};
++		ctx.signal?.addEventListener("abort", onAbort, { once: true });
++		if (ctx.signal?.aborted) {
++			await release();
++			throw ctx.signal.reason ?? new Error("Request aborted before subscription usage dispatch");
++		}
++		try {
++			const resolution = await resolver({ ...ctx, preferredCredentialId: admitted.credentialId });
++			const object = typeof resolution === "object" && resolution !== null ? resolution : undefined;
++			if (object?.credentialId !== admitted.credentialId) {
++				// The native resolver could not honor the admitted row (it was
++				// blocked, removed, or fell through to an API key/env source).
++				// Never let a different credential ride this lease.
++				await release();
++				throw new SubscriptionUsagePolicyError(provider, "unknown", {
++					detail: `admitted credential:${admitted.credentialId} is no longer available`,
++				});
++			}
++			const resolved: ResolvedApiKey = {
++				...object,
++				providerAttemptAdmission: {
++					reserve: async credentialId => {
++						if (credentialId !== admitted.credentialId) {
++							await release();
++							throw new SubscriptionUsagePolicyError(provider, "unknown", {
++								detail: `dispatched credential does not match admitted credential:${admitted.credentialId}`,
++							});
++						}
++						return release;
++					},
++				},
++			};
++			return resolved;
++		} catch (error) {
++			await release();
++			throw error;
++		}
++	};
++}
++
++/**
++ * Wrap a session's request-key resolver with subscription-usage admission.
++ * Only resolver forms participate; static keys have no credential to admit.
++ */
++export function withSubscriptionUsagePolicy(
++	base: NonNullable<AgentOptions["getApiKey"]>,
++	options: {
++		agentDir?: string;
++		sessionId: () => string | undefined;
++		storage?: AuthStorage;
++	},
++): NonNullable<AgentOptions["getApiKey"]> {
++	const agentDir = options.agentDir ?? getAgentDir();
++	return model => {
++		const unwrap = (key: ApiKey | undefined): ApiKey | undefined => {
++			if (!isApiKeyResolver(key)) return key;
++			return wrapResolver(key, model, agentDir, options.sessionId(), options.storage);
++		};
++		const resolved = base(model);
++		return resolved instanceof Promise ? resolved.then(unwrap) : unwrap(resolved);
++	};
++}
+diff --git a/packages/coding-agent/src/task/subscription-usage.ts b/packages/coding-agent/src/task/subscription-usage.ts
+new file mode 100644
+index 0000000..86a41cd
+--- /dev/null
++++ b/packages/coding-agent/src/task/subscription-usage.ts
+@@ -0,0 +1,304 @@
++import * as fs from "node:fs";
++import * as path from "node:path";
++
++export type CurveMode = "linear" | "step" | "smooth";
++
++export interface CurvePoint {
++	/** Minutes remaining until reset, strictly descending in a curve. */
++	remainingMinutes: number;
++	/** Hard background cap, percent of the whole window already consumed. */
++	hardPercent: number;
++	/** Optional soft cap; soft <= hard. */
++	softPercent?: number;
++}
++
++export interface WindowCurve {
++	mode: CurveMode;
++	points: CurvePoint[];
++}
++
++export interface AccountWindowOverrides {
++	fiveHour?: WindowCurve;
++	weekly?: WindowCurve;
++}
++
++export interface AccountPolicyOverride {
++	windows: AccountWindowOverrides;
++}
++
++export interface ProviderPolicy {
++	maxInFlight: number;
++	maxWaitMs: number;
++	fiveHour: WindowCurve;
++	weekly: WindowCurve;
++	accounts: Record<string, AccountPolicyOverride>;
++}
++
++export interface SubscriptionUsagePolicy {
++	version: 1;
++	providers: Record<string, ProviderPolicy>;
++}
++
++export type PolicyLoad =
++	| { status: "disabled"; path: string }
++	| { status: "error"; path: string; message: string }
++	| { status: "ready"; path: string; policy: SubscriptionUsagePolicy };
++
++export const SUBSCRIPTION_USAGE_FILENAME = "subscription-usage.yml";
++
++const DURATION = /^(0|[1-9][0-9]*)(m|h|d)$/;
++const WINDOWS = ["5h", "7d"] as const;
++const CURVE_MODES: readonly CurveMode[] = ["linear", "step", "smooth"];
++
++class PolicyValidationError extends Error {
++	constructor(
++		readonly field: string,
++		message: string,
++	) {
++		super(message);
++	}
++}
++
++function invalid(field: string, message: string): never {
++	throw new PolicyValidationError(field, message);
++}
++
++function record(value: unknown, field: string): Record<string, unknown> {
++	if (typeof value !== "object" || value === null || Array.isArray(value)) invalid(field, "must be a mapping");
++	return value as Record<string, unknown>;
++}
++
++function onlyKeys(value: Record<string, unknown>, allowed: readonly string[], field: string): void {
++	for (const key of Object.keys(value)) {
++		if (!allowed.includes(key)) invalid(`${field}.${key}`, "is not a supported field");
++	}
++}
++
++function duration(value: unknown, field: string, unitMs: number): number {
++	if (typeof value !== "string") invalid(field, "must be a duration string");
++	const match = DURATION.exec(value);
++	if (!match) invalid(field, "must match ^(0|[1-9][0-9]*)(m|h|d)$");
++	const amount = Number(match[1]);
++	const multiplier = match[2] === "m" ? 1 : match[2] === "h" ? 60 : 1440;
++	const result = amount * multiplier * unitMs;
++	if (!Number.isSafeInteger(result)) invalid(field, "duration is too large");
++	return result;
++}
++
++function percentage(value: unknown, field: string): number {
++	if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 100) {
++		invalid(field, "must be a finite number from 0 to 100");
++	}
++	return value;
++}
++
++function parseCurve(value: unknown, field: string, expectedWindowMinutes?: number): WindowCurve {
++	const input = record(value, field);
++	onlyKeys(input, ["mode", "points"], field);
++	if (typeof input.mode !== "string" || !CURVE_MODES.includes(input.mode as CurveMode)) {
++		invalid(`${field}.mode`, "must be linear, step, or smooth");
++	}
++	if (!Array.isArray(input.points)) invalid(`${field}.points`, "must be an array");
++	if (input.points.length < 2) invalid(`${field}.points`, "must contain at least two points");
++
++	const points: CurvePoint[] = [];
++	let hasSoft: boolean | undefined;
++	for (let index = 0; index < input.points.length; index++) {
++		const pointField = `${field}.points[${index}]`;
++		const rawPoint: unknown = input.points[index];
++		if (!Array.isArray(rawPoint) || (rawPoint.length !== 2 && rawPoint.length !== 3)) {
++			invalid(pointField, "must be [duration, hardPercent, softPercent?]");
++		}
++		const remainingMinutes = duration(rawPoint[0], `${pointField}[0]`, 1);
++		const hardPercent = percentage(rawPoint[1], `${pointField}[1]`);
++		const pointHasSoft = rawPoint.length === 3;
++		if (hasSoft !== undefined && hasSoft !== pointHasSoft) {
++			invalid(pointField, "all points must either specify softPercent or omit it");
++		}
++		hasSoft = pointHasSoft;
++
++		let softPercent: number | undefined;
++		if (pointHasSoft) {
++			softPercent = percentage(rawPoint[2], `${pointField}[2]`);
++			if (softPercent > hardPercent) invalid(`${pointField}[2]`, "must not exceed hardPercent");
++		}
++
++		const previous = points[index - 1];
++		if (previous) {
++			if (remainingMinutes >= previous.remainingMinutes) {
++				invalid(`${pointField}[0]`, "durations must be strictly descending and unique");
++			}
++			if (hardPercent < previous.hardPercent) {
++				invalid(`${pointField}[1]`, "hardPercent must be nondecreasing from first to last");
++			}
++			if (softPercent !== undefined && previous.softPercent !== undefined && softPercent < previous.softPercent) {
++				invalid(`${pointField}[2]`, "softPercent must be nondecreasing from first to last");
++			}
++		}
++		points.push(
++			softPercent === undefined ? { remainingMinutes, hardPercent } : { remainingMinutes, hardPercent, softPercent },
++		);
++	}
++
++	if (expectedWindowMinutes !== undefined && points[0].remainingMinutes !== expectedWindowMinutes) {
++		invalid(`${field}.points[0][0]`, `must be ${expectedWindowMinutes} minutes for this window`);
++	}
++	if (points[points.length - 1].remainingMinutes !== 0) {
++		invalid(`${field}.points[${points.length - 1}][0]`, "last duration must be 0 minutes");
++	}
++
++	return { mode: input.mode as CurveMode, points };
++}
++
++function parseProvider(value: unknown, field: string): ProviderPolicy {
++	const input = record(value, field);
++	onlyKeys(input, ["maxInFlight", "maxWait", "windows", "accounts"], field);
++	if (!Number.isSafeInteger(input.maxInFlight) || (input.maxInFlight as number) <= 0) {
++		invalid(`${field}.maxInFlight`, "must be a positive safe integer");
++	}
++	const maxWaitMs = input.maxWait === undefined ? 5 * 60_000 : duration(input.maxWait, `${field}.maxWait`, 60_000);
++	const windows = record(input.windows, `${field}.windows`);
++	onlyKeys(windows, WINDOWS, `${field}.windows`);
++	for (const name of WINDOWS) {
++		if (!(name in windows)) invalid(`${field}.windows.${name}`, "is required");
++	}
++
++	const accounts: Record<string, AccountPolicyOverride> = {};
++	if (input.accounts !== undefined) {
++		const rawAccounts = record(input.accounts, `${field}.accounts`);
++		for (const [key, value] of Object.entries(rawAccounts)) {
++			const accountField = `${field}.accounts.${key}`;
++			if (!/^credential:[1-9][0-9]*$/.test(key)) {
++				invalid(accountField, "key must match ^credential:[1-9][0-9]*$");
++			}
++			const account = record(value, accountField);
++			onlyKeys(account, ["windows"], accountField);
++			const overrideWindows = record(account.windows, `${accountField}.windows`);
++			onlyKeys(overrideWindows, WINDOWS, `${accountField}.windows`);
++			if (Object.keys(overrideWindows).length === 0) {
++				invalid(`${accountField}.windows`, "must override at least one window");
++			}
++			const parsedWindows: AccountWindowOverrides = {};
++			if ("5h" in overrideWindows) {
++				parsedWindows.fiveHour = parseCurve(overrideWindows["5h"], `${accountField}.windows.5h`, 300);
++			}
++			if ("7d" in overrideWindows) {
++				parsedWindows.weekly = parseCurve(overrideWindows["7d"], `${accountField}.windows.7d`, 10080);
++			}
++			accounts[key] = { windows: parsedWindows };
++		}
++	}
++
++	return {
++		maxInFlight: input.maxInFlight as number,
++		maxWaitMs,
++		fiveHour: parseCurve(windows["5h"], `${field}.windows.5h`, 300),
++		weekly: parseCurve(windows["7d"], `${field}.windows.7d`, 10080),
++		accounts,
++	};
++}
++
++function parsePolicy(value: unknown): SubscriptionUsagePolicy {
++	const input = record(value, "document");
++	onlyKeys(input, ["version", "providers"], "document");
++	if (input.version !== 1) invalid("version", "must be 1");
++	const rawProviders = record(input.providers, "providers");
++	const providers: Record<string, ProviderPolicy> = {};
++	for (const [id, provider] of Object.entries(rawProviders)) {
++		providers[id] = parseProvider(provider, `providers.${id}`);
++	}
++	return { version: 1, providers };
++}
++
++function errorMessage(error: unknown): string {
++	return error instanceof Error ? error.message : String(error);
++}
++
++function loadError(filePath: string, field: string, message: string): PolicyLoad {
++	return { status: "error", path: filePath, message: `${filePath}: ${field}: ${message}` };
++}
++
++/** Reads <agentDir>/subscription-usage.yml once per call. Only ENOENT means disabled. */
++export function loadSubscriptionUsagePolicy(agentDir: string): PolicyLoad {
++	const filePath = path.join(agentDir, SUBSCRIPTION_USAGE_FILENAME);
++	let text: string;
++	try {
++		text = fs.readFileSync(filePath, "utf8");
++	} catch (error) {
++		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
++			return { status: "disabled", path: filePath };
++		}
++		return loadError(filePath, "file", errorMessage(error));
++	}
++
++	let parsed: unknown;
++	try {
++		parsed = Bun.YAML.parse(text) as unknown;
++	} catch (error) {
++		return loadError(filePath, "yaml", `invalid YAML: ${errorMessage(error)}`);
++	}
++
++	try {
++		return { status: "ready", path: filePath, policy: parsePolicy(parsed) };
++	} catch (error) {
++		if (error instanceof PolicyValidationError) return loadError(filePath, error.field, error.message);
++		return loadError(filePath, "document", `invalid configuration: ${errorMessage(error)}`);
++	}
++}
++
++export function evaluateCurve(
++	curve: WindowCurve,
++	remainingMinutes: number,
++): { hardPercent: number; softPercent?: number } | undefined {
++	const points = curve.points;
++	if (Number.isNaN(remainingMinutes) || points.length < 2) return undefined;
++	const first = points[0];
++	const last = points[points.length - 1];
++	if (!first || !last || !Number.isFinite(first.remainingMinutes)) return undefined;
++
++	const remaining = Math.max(0, Math.min(remainingMinutes, first.remainingMinutes));
++	if (remaining >= first.remainingMinutes) {
++		return first.softPercent === undefined
++			? { hardPercent: first.hardPercent }
++			: { hardPercent: first.hardPercent, softPercent: first.softPercent };
++	}
++	if (remaining <= 0) {
++		return last.softPercent === undefined
++			? { hardPercent: last.hardPercent }
++			: { hardPercent: last.hardPercent, softPercent: last.softPercent };
++	}
++
++	for (let index = 1; index < points.length; index++) {
++		const current = points[index];
++		const previous = points[index - 1];
++		if (remaining === current.remainingMinutes) {
++			return current.softPercent === undefined
++				? { hardPercent: current.hardPercent }
++				: { hardPercent: current.hardPercent, softPercent: current.softPercent };
++		}
++		if (remaining > current.remainingMinutes) {
++			if (curve.mode === "step") {
++				return previous.softPercent === undefined
++					? { hardPercent: previous.hardPercent }
++					: { hardPercent: previous.hardPercent, softPercent: previous.softPercent };
++			}
++			if (curve.mode !== "linear" && curve.mode !== "smooth") return undefined;
++			const t = (previous.remainingMinutes - remaining) / (previous.remainingMinutes - current.remainingMinutes);
++			const amount = curve.mode === "smooth" ? t * t * (3 - 2 * t) : t;
++			const hardPercent = previous.hardPercent + (current.hardPercent - previous.hardPercent) * amount;
++			if (previous.softPercent !== undefined && current.softPercent !== undefined) {
++				return {
++					hardPercent,
++					softPercent: previous.softPercent + (current.softPercent - previous.softPercent) * amount,
++				};
++			}
++			return { hardPercent };
++		}
++	}
++	return undefined;
++}
++
++/** Resolve the effective curve for a durable credential row id. */
++export function curveFor(policy: ProviderPolicy, window: "fiveHour" | "weekly", credentialId: number): WindowCurve {
++	return policy.accounts[`credential:${credentialId}`]?.windows[window] ?? policy[window];
++}
+diff --git a/packages/coding-agent/src/thread/services/auth-protocol.ts b/packages/coding-agent/src/thread/services/auth-protocol.ts
+index e4e5d68..191b262 100644
+--- a/packages/coding-agent/src/thread/services/auth-protocol.ts
++++ b/packages/coding-agent/src/thread/services/auth-protocol.ts
+@@ -65,6 +65,7 @@ import type {
+ 	ServiceTier,
+ 	StoredAuthCredential,
+ 	StoredCredentialBlock,
++	SubscriptionCandidatesResult,
+ 	UsageHistoryEntry,
+ 	UsageHistoryQuery,
+ 	UsageLimitMarkResult,
+@@ -181,6 +182,10 @@ export type AuthStorageProtocol = {
+ 		[provider: string, sessionId?: string, options?: AuthApiKeyOptions],
+ 		ResolvedApiKey | undefined
+ 	>;
++	"keys.subscriptionCandidates": RpcMethod<
++		[provider: string, sessionId?: string, options?: AuthApiKeyOptions],
++		SubscriptionCandidatesResult
++	>;
+ 	"keys.peek": RpcMethod<[provider: string, options?: AuthPeekOptions], string | undefined>;
+ 	/** `keys.source` with another than the default `env` mode (the availability table holds the default). */
+ 	"keys.source": RpcMethod<[provider: string, options?: AuthSourceOptions], AuthSource | undefined>;
+diff --git a/packages/coding-agent/src/thread/services/auth-remote.ts b/packages/coding-agent/src/thread/services/auth-remote.ts
+index 78b7466..4b02a1e 100644
+--- a/packages/coding-agent/src/thread/services/auth-remote.ts
++++ b/packages/coding-agent/src/thread/services/auth-remote.ts
+@@ -62,6 +62,7 @@ import type {
+ 	ResetCreditRedeemOutcome,
+ 	ResetsApi,
+ 	ResolvedApiKey,
++	SubscriptionCandidatesResult,
+ 	RotateCredentialOptions,
+ 	ServiceTier,
+ 	SessionRestrictionLease,
+@@ -314,6 +315,13 @@ class RemoteKeys implements KeysApi {
+ 	): Promise<ResolvedApiKey | undefined> {
+ 		return this.#remote.call("keys.getWithCredential", provider, sessionId, options);
+ 	}
++	subscriptionCandidates(
++		provider: string,
++		sessionId?: string,
++		options?: AuthApiKeyOptions,
++	): Promise<SubscriptionCandidatesResult> {
++		return this.#remote.call("keys.subscriptionCandidates", provider, sessionId, options);
++	}
+ 	peek(provider: string, options?: AuthPeekOptions): Promise<string | undefined> {
+ 		return this.#remote.call("keys.peek", provider, options);
+ 	}
+diff --git a/packages/coding-agent/src/thread/services/auth.ts b/packages/coding-agent/src/thread/services/auth.ts
+index 443a22b..b80671e 100644
+--- a/packages/coding-agent/src/thread/services/auth.ts
++++ b/packages/coding-agent/src/thread/services/auth.ts
+@@ -221,6 +221,8 @@ function serveAuthStorage(state: PeerAuthState): RpcServe<AuthStorage, AuthStora
+ 			storage.keys.prefetchUsage(provider, sessionId, options),
+ 		"keys.getWithCredential": (storage, provider, sessionId, options) =>
+ 			storage.keys.getWithCredential(provider, sessionId, options),
++		"keys.subscriptionCandidates": (storage, provider, sessionId, options) =>
++			storage.keys.subscriptionCandidates(provider, sessionId, options),
+ 		"keys.peek": (storage, provider, options) => storage.keys.peek(provider, options),
+ 		"keys.source": (storage, provider, options) => storage.keys.source(provider, options),
+ 		"keys.availability": (storage, providers) => authAvailability(storage, providers),
+diff --git a/packages/coding-agent/src/thread/services/index.ts b/packages/coding-agent/src/thread/services/index.ts
+index 1346f77..d25d481 100644
+--- a/packages/coding-agent/src/thread/services/index.ts
++++ b/packages/coding-agent/src/thread/services/index.ts
+@@ -16,6 +16,7 @@ import { memoryThreadService } from "./memory";
+ import { runtimeThreadService } from "./runtime";
+ import { runtimeIdentityThreadService } from "./runtime-identity";
+ import { settingsThreadService } from "./settings";
++import { subscriptionUsageThreadService } from "./subscription-usage";
+ import { telemetryThreadService } from "./telemetry";
+ 
+ export const THREAD_SERVICES: readonly ThreadService[] = [
+@@ -25,6 +26,7 @@ export const THREAD_SERVICES: readonly ThreadService[] = [
+ 	runtimeIdentityThreadService,
+ 	settingsThreadService,
+ 	authService,
++	subscriptionUsageThreadService,
+ 	agentsThreadService,
+ 	lspThreadService,
+ 	telemetryThreadService,
+diff --git a/packages/coding-agent/src/thread/services/subscription-usage.ts b/packages/coding-agent/src/thread/services/subscription-usage.ts
+new file mode 100644
+index 0000000..c92376f
+--- /dev/null
++++ b/packages/coding-agent/src/thread/services/subscription-usage.ts
+@@ -0,0 +1,141 @@
++/**
++ * Subscription-usage admission bridge between the main thread and subagent
++ * workers.
++ *
++ * The controller — and therefore the background slot counters — lives on the
++ * main thread for the whole profile. A worker receives one endpoint per peer;
++ * `admit` may wait there under the worker's own abort signal, and every lease
++ * the worker holds is released when the worker exits. Policy configuration and
++ * usage probes never move into the worker.
++ */
++import { getAgentDir } from "@oh-my-pi/pi-utils";
++import type { WorkerThreadLink } from "../protocol";
++import { type RemoteObject, type RpcMethod } from "../rpc";
++import type { ThreadService, WorkerPeer } from "../services";
++import type { SubscriptionCandidateRequest } from "../../task/subscription-usage-controller";
++import {
++	getMainSubscriptionUsageController,
++	setRemoteSubscriptionUsageController,
++	type SubscriptionAdmitResult,
++	type SubscriptionUsageControllerLike,
++} from "../../task/subscription-usage-wiring";
++
++/** Exported-class kind of one worker's main-side subscription-usage endpoint. */
++export const SUBSCRIPTION_USAGE_KIND = "subscription-usage";
++
++/** Methods a worker calls on its main-side endpoint. */
++export type SubscriptionUsageProtocol = {
++	admit: RpcMethod<[request: SubscriptionCandidateRequest], SubscriptionAdmitResult>;
++	release: RpcMethod<[leaseId: number], void>;
++	status: RpcMethod<[], string>;
++};
++
++/** Boot globals of {@link subscriptionUsageThreadService}. */
++export interface SubscriptionUsageServiceGlobals {
++	readonly endpoint: PeerSubscriptionUsageEndpoint;
++}
++
++/** Main-side endpoint of one worker; tracks its leases and pending waits. */
++export class PeerSubscriptionUsageEndpoint {
++	readonly #exit = new AbortController();
++	readonly #leases = new Set<number>();
++
++	#controller(): SubscriptionUsageControllerLike {
++		const agentDir = getAgentDir();
++		return getMainSubscriptionUsageController(agentDir);
++	}
++
++	async admit(request: SubscriptionCandidateRequest): Promise<SubscriptionAdmitResult> {
++		const signal = request.signal ? AbortSignal.any([request.signal, this.#exit.signal]) : this.#exit.signal;
++		const controller = this.#controller();
++		const result = await controller.admit({ ...request, signal });
++		if (result.status === "admitted") this.#leases.add(result.leaseId);
++		return result;
++	}
++
++	async release(leaseId: number): Promise<void> {
++		this.#leases.delete(leaseId);
++		await this.#controller().release(leaseId);
++	}
++
++	status(): Promise<string> {
++		return this.#controller().status();
++	}
++
++	/** Worker exit: stop waits and free every slot it still held. */
++	close(): void {
++		this.#exit.abort(new Error("Subagent worker exited"));
++		if (this.#leases.size === 0) return;
++		const controller = this.#controller();
++		for (const leaseId of this.#leases) void controller.release(leaseId);
++		this.#leases.clear();
++	}
++}
++
++/** Worker-side proxy of {@link PeerSubscriptionUsageEndpoint}. */
++export class RemoteSubscriptionUsageController implements SubscriptionUsageControllerLike {
++	readonly #remote: RemoteObject<SubscriptionUsageProtocol>;
++
++	constructor(remote: RemoteObject<SubscriptionUsageProtocol>) {
++		this.#remote = remote;
++	}
++
++	admit(request: SubscriptionCandidateRequest): Promise<SubscriptionAdmitResult> {
++		return this.#remote.call("admit", request);
++	}
++
++	release(leaseId: number): Promise<void> {
++		return this.#remote.call("release", leaseId);
++	}
++
++	status(): Promise<string> {
++		return this.#remote.call("status");
++	}
++}
++
++const endpoints = new WeakMap<WorkerPeer, PeerSubscriptionUsageEndpoint>();
++
++/** Per-profile background admission slots shared by main and every worker. */
++export const subscriptionUsageThreadService: ThreadService = {
++	name: "subscriptionUsage",
++
++	installMain(peer: WorkerPeer): void {
++		const endpoint = new PeerSubscriptionUsageEndpoint();
++		endpoints.set(peer, endpoint);
++		peer.link.exportClass<PeerSubscriptionUsageEndpoint, SubscriptionUsageProtocol>(
++			SUBSCRIPTION_USAGE_KIND,
++			(value): value is PeerSubscriptionUsageEndpoint => value instanceof PeerSubscriptionUsageEndpoint,
++			{
++				admit: (target, request) => target.admit(request),
++				release: (target, leaseId) => target.release(leaseId),
++				status: target => target.status(),
++			},
++		);
++	},
++
++	globals(peer: WorkerPeer): SubscriptionUsageServiceGlobals {
++		const endpoint = endpoints.get(peer);
++		if (!endpoint) throw new Error("subscription-usage service: endpoint missing for worker");
++		return { endpoint };
++	},
++
++	onWorkerExit(peer: WorkerPeer): void {
++		endpoints.get(peer)?.close();
++		endpoints.delete(peer);
++	},
++
++	installWorker(link: WorkerThreadLink): void {
++		link.importClass<RemoteSubscriptionUsageController, SubscriptionUsageProtocol>(
++			SUBSCRIPTION_USAGE_KIND,
++			remote => new RemoteSubscriptionUsageController(remote),
++		);
++	},
++
++	async boot(globals: unknown): Promise<void> {
++		const endpoint = (globals as Partial<SubscriptionUsageServiceGlobals> | undefined)?.endpoint;
++		if (!(endpoint instanceof RemoteSubscriptionUsageController)) {
++			throw new Error("subscription-usage service: boot globals lack the main endpoint");
++		}
++		setRemoteSubscriptionUsageController(endpoint);
++	},
++};
+diff --git a/packages/coding-agent/test/subscription-usage-controller.test.ts b/packages/coding-agent/test/subscription-usage-controller.test.ts
+new file mode 100644
+index 0000000..a4de7ff
+--- /dev/null
++++ b/packages/coding-agent/test/subscription-usage-controller.test.ts
+@@ -0,0 +1,395 @@
++import { describe, expect, it } from "bun:test";
++import { SubscriptionUsagePolicyError } from "@oh-my-pi/pi-ai";
++import type { PolicyLoad, SubscriptionUsagePolicy, WindowCurve } from "../src/task/subscription-usage";
++import {
++	SubscriptionUsageController,
++	type SubscriptionCandidateSnapshot,
++	type SubscriptionCandidatesSource,
++} from "../src/task/subscription-usage-controller";
++
++const NOW = 1_000_000;
++const CONFIG_PATH = "/agent/subscription-usage.yml";
++const FIVE_HOUR_MS = 300 * 60_000;
++const WEEKLY_MS = 10080 * 60_000;
++
++function curve(hardPercent: number, softPercent?: number): WindowCurve {
++	const point = (remainingMinutes: number) => ({
++		remainingMinutes,
++		hardPercent,
++		...(softPercent === undefined ? {} : { softPercent }),
++	});
++	return { mode: "linear", points: [point(300), point(0)] };
++}
++
++function readyPolicy(
++	options: {
++		maxInFlight?: number;
++		maxWaitMs?: number;
++		fiveHourHard?: number;
++		fiveHourSoft?: number;
++		weeklyHard?: number;
++		weeklySoft?: number;
++		accounts?: SubscriptionUsagePolicy["providers"][string]["accounts"];
++	} = {},
++): PolicyLoad {
++	return {
++		status: "ready",
++		path: CONFIG_PATH,
++		policy: {
++			version: 1,
++			providers: {
++				"test-provider": {
++					maxInFlight: options.maxInFlight ?? 4,
++					maxWaitMs: options.maxWaitMs ?? 0,
++					fiveHour: curve(options.fiveHourHard ?? 65, options.fiveHourSoft ?? 50),
++					weekly: curve(options.weeklyHard ?? 100, options.weeklySoft ?? 90),
++					accounts: options.accounts ?? {},
++				},
++			},
++		},
++	};
++}
++
++function candidate(
++	options: {
++		credentialId?: number;
++		poolId?: string;
++		order?: number;
++		fetchedAt?: number | null;
++		blockedUntil?: number;
++		fiveHourUsed?: number;
++		weeklyUsed?: number;
++		fiveHourReset?: number;
++		weeklyReset?: number;
++		identity?: string;
++	} = {},
++): SubscriptionCandidateSnapshot {
++	return {
++		credentialId: options.credentialId ?? 1,
++		poolId: options.poolId ?? "pool-a",
++		order: options.order ?? 0,
++		fetchedAt: options.fetchedAt === undefined ? NOW : options.fetchedAt,
++		...(options.blockedUntil === undefined ? {} : { blockedUntil: options.blockedUntil }),
++		...(options.identity === undefined ? {} : { identity: options.identity }),
++		meters: [
++			{
++				id: "5h-meter",
++				label: "5-hour",
++				durationMs: FIVE_HOUR_MS,
++				resetsAt: options.fiveHourReset ?? NOW + FIVE_HOUR_MS,
++				usedFraction: options.fiveHourUsed ?? 0.3,
++			},
++			{
++				id: "7d-meter",
++				label: "weekly",
++				durationMs: WEEKLY_MS,
++				resetsAt: options.weeklyReset ?? NOW + WEEKLY_MS,
++				usedFraction: options.weeklyUsed ?? 0,
++			},
++		],
++	};
++}
++
++function sourceFor(candidates: readonly SubscriptionCandidateSnapshot[]): SubscriptionCandidatesSource {
++	return { candidates: async () => ({ supported: true, candidates }) };
++}
++
++function signalAwareSleep(counter?: { count: number }): (ms: number, signal?: AbortSignal) => Promise<void> {
++	return (_ms, signal) => {
++		if (counter) counter.count++;
++		if (signal?.aborted) return Promise.resolve();
++		const { promise, resolve } = Promise.withResolvers<void>();
++		signal?.addEventListener("abort", () => resolve(), { once: true });
++		return promise;
++	};
++}
++
++async function waitUntil(predicate: () => boolean): Promise<void> {
++	for (let attempt = 0; attempt < 100; attempt++) {
++		if (predicate()) return;
++		await Promise.resolve();
++	}
++	throw new Error("condition was not reached");
++}
++
++describe("SubscriptionUsageController", () => {
++	it("admits two of four slots at 35 headroom and release wakes the third request", async () => {
++		const sleepers = { count: 0 };
++		const controller = new SubscriptionUsageController({
++			agentDir: "/agent",
++			policy: readyPolicy({ maxInFlight: 4, maxWaitMs: 60_000 }),
++			source: sourceFor([candidate({ fiveHourUsed: 0.3 })]),
++			now: () => NOW,
++			sleep: signalAwareSleep(sleepers),
++		});
++
++		const first = await controller.admit({ provider: "test-provider" });
++		const second = await controller.admit({ provider: "test-provider" });
++		expect(first.status).toBe("admitted");
++		expect(second.status).toBe("admitted");
++		if (first.status !== "admitted") throw new Error("first request was not admitted");
++
++		let thirdSettled = false;
++		const thirdPromise = controller.admit({ provider: "test-provider" }).then(result => {
++			thirdSettled = true;
++			return result;
++		});
++		await waitUntil(() => sleepers.count > 0);
++		expect(thirdSettled).toBe(false);
++		await controller.release(first.leaseId);
++		const third = await thirdPromise;
++		expect(third.status).toBe("admitted");
++	});
++
++	it("does not dispatch after headroom falls to 20 with one running, then admits after the second release", async () => {
++		const sleepers = { count: 0 };
++		const snapshot = candidate({ fiveHourUsed: 0.3 });
++		const controller = new SubscriptionUsageController({
++			agentDir: "/agent",
++			policy: readyPolicy({ maxInFlight: 4, maxWaitMs: 60_000 }),
++			source: sourceFor([snapshot]),
++			now: () => NOW,
++			sleep: signalAwareSleep(sleepers),
++		});
++		const first = await controller.admit({ provider: "test-provider" });
++		const second = await controller.admit({ provider: "test-provider" });
++		if (first.status !== "admitted" || second.status !== "admitted")
++			throw new Error("initial slots were not admitted");
++
++		snapshot.meters[0]!.usedFraction = 0.45;
++		let thirdSettled = false;
++		const thirdPromise = controller.admit({ provider: "test-provider" }).then(result => {
++			thirdSettled = true;
++			return result;
++		});
++		await waitUntil(() => sleepers.count > 0);
++		await controller.release(first.leaseId);
++		await waitUntil(() => sleepers.count > 1);
++		expect(thirdSettled).toBe(false);
++		await controller.release(second.leaseId);
++		expect((await thirdPromise).status).toBe("admitted");
++	});
++
++	it("uses an account override when computing headroom", async () => {
++		const policy = readyPolicy({
++			maxInFlight: 4,
++			fiveHourHard: 50,
++			accounts: {
++				"credential:2": { windows: { fiveHour: curve(90, 70) } },
++			},
++		});
++		const controller = new SubscriptionUsageController({
++			agentDir: "/agent",
++			policy,
++			source: sourceFor([
++				candidate({ credentialId: 1, poolId: "pool-a", order: 0, fiveHourUsed: 0.1 }),
++				candidate({ credentialId: 2, poolId: "pool-b", order: 1, fiveHourUsed: 0.1 }),
++			]),
++			now: () => NOW,
++		});
++		expect(await controller.admit({ provider: "test-provider" })).toMatchObject({
++			status: "admitted",
++			credentialId: 2,
++		});
++	});
++
++	it("uses a soft fallback only after the preferred pool is full", async () => {
++		const controller = new SubscriptionUsageController({
++			agentDir: "/agent",
++			policy: readyPolicy({ maxInFlight: 4, fiveHourHard: 75, fiveHourSoft: 60 }),
++			source: sourceFor([
++				candidate({ credentialId: 1, poolId: "preferred", fiveHourUsed: 0.5 }),
++				candidate({ credentialId: 2, poolId: "fallback", order: 1, fiveHourUsed: 0.65 }),
++			]),
++			now: () => NOW,
++		});
++		expect(await controller.admit({ provider: "test-provider" })).toMatchObject({
++			status: "admitted",
++			credentialId: 1,
++		});
++		expect(await controller.admit({ provider: "test-provider" })).toMatchObject({
++			status: "admitted",
++			credentialId: 2,
++		});
++	});
++
++	it("throws a hard-cap error at zero headroom", async () => {
++		const controller = new SubscriptionUsageController({
++			agentDir: "/agent",
++			policy: readyPolicy({ fiveHourHard: 65 }),
++			source: sourceFor([candidate({ fiveHourUsed: 0.65 })]),
++			now: () => NOW,
++		});
++		await expect(controller.admit({ provider: "test-provider" })).rejects.toMatchObject({
++			name: "SubscriptionUsagePolicyError",
++			reason: "hard-cap",
++		});
++	});
++
++	it("throws cooldown for a blocked candidate", async () => {
++		const controller = new SubscriptionUsageController({
++			agentDir: "/agent",
++			policy: readyPolicy(),
++			source: sourceFor([candidate({ blockedUntil: NOW + 1_000 })]),
++			now: () => NOW,
++		});
++		await expect(controller.admit({ provider: "test-provider" })).rejects.toMatchObject({
++			name: "SubscriptionUsagePolicyError",
++			reason: "cooldown",
++		});
++	});
++
++	it("does not admit a stale usage report", async () => {
++		const controller = new SubscriptionUsageController({
++			agentDir: "/agent",
++			policy: readyPolicy(),
++			source: sourceFor([candidate({ fetchedAt: NOW - 375_001 })]),
++			now: () => NOW,
++		});
++		await expect(controller.admit({ provider: "test-provider" })).rejects.toMatchObject({
++			name: "SubscriptionUsagePolicyError",
++			reason: "unknown",
++		});
++	});
++
++	it("times out with the capacity reason", async () => {
++		let now = NOW;
++		const controller = new SubscriptionUsageController({
++			agentDir: "/agent",
++			policy: readyPolicy({ maxInFlight: 1, maxWaitMs: 500 }),
++			source: sourceFor([candidate({ fiveHourUsed: 0 })]),
++			now: () => now,
++			sleep: async ms => {
++				now += ms;
++			},
++			pollMs: 15_000,
++		});
++		const first = await controller.admit({ provider: "test-provider" });
++		if (first.status !== "admitted") throw new Error("first request was not admitted");
++		await expect(controller.admit({ provider: "test-provider" })).rejects.toMatchObject({
++			name: "SubscriptionUsagePolicyError",
++			reason: "capacity",
++		});
++	});
++
++	it("rejects an aborted waiter", async () => {
++		const sleepers = { count: 0 };
++		const controller = new SubscriptionUsageController({
++			agentDir: "/agent",
++			policy: readyPolicy({ maxInFlight: 1, maxWaitMs: 60_000 }),
++			source: sourceFor([candidate({ fiveHourUsed: 0 })]),
++			now: () => NOW,
++			sleep: signalAwareSleep(sleepers),
++		});
++		await controller.admit({ provider: "test-provider" });
++		const abort = new AbortController();
++		const waiter = controller.admit({ provider: "test-provider", signal: abort.signal });
++		await waitUntil(() => sleepers.count > 0);
++		abort.abort("cancelled");
++		await expect(waiter).rejects.toBe("cancelled");
++	});
++
++	it("releases a lease idempotently", async () => {
++		const controller = new SubscriptionUsageController({
++			agentDir: "/agent",
++			policy: readyPolicy({ maxInFlight: 1 }),
++			source: sourceFor([candidate({ fiveHourUsed: 0 })]),
++			now: () => NOW,
++		});
++		const result = await controller.admit({ provider: "test-provider" });
++		if (result.status !== "admitted") throw new Error("request was not admitted");
++		await controller.release(result.leaseId);
++		await controller.release(result.leaseId);
++		expect(await controller.admit({ provider: "test-provider" })).toMatchObject({ status: "admitted" });
++	});
++
++	it("reports disabled, error, and ready policy status", async () => {
++		const disabled = new SubscriptionUsageController({
++			agentDir: "/agent",
++			policy: { status: "disabled", path: CONFIG_PATH },
++			source: sourceFor([]),
++			now: () => NOW,
++		});
++		const disabledStatus = await disabled.status();
++		expect(disabledStatus).toContain(CONFIG_PATH);
++		expect(disabledStatus).toContain("absent");
++		expect(disabledStatus).toContain("Example:");
++		expect(disabledStatus).toContain("Restart OMP after editing");
++
++		const errored = new SubscriptionUsageController({
++			agentDir: "/agent",
++			policy: {
++				status: "error",
++				path: CONFIG_PATH,
++				message: `${CONFIG_PATH}: providers.test-provider.maxInFlight is invalid`,
++			},
++			source: sourceFor([]),
++			now: () => NOW,
++		});
++		const errorStatus = await errored.status();
++		expect(errorStatus).toContain("providers.test-provider.maxInFlight");
++		expect(errorStatus).toContain("Restart OMP after editing");
++		await expect(errored.admit({ provider: "test-provider" })).rejects.toBeInstanceOf(SubscriptionUsagePolicyError);
++
++		const ready = new SubscriptionUsageController({
++			agentDir: "/agent",
++			policy: readyPolicy(),
++			source: sourceFor([candidate({ identity: "alice\ninjected" })]),
++			now: () => NOW,
++		});
++		const readyStatus = await ready.status();
++		expect(readyStatus).toContain("Provider test-provider: running=0/2 (max=4), waiting=0");
++		expect(readyStatus).toContain("credential:1 preferred");
++		expect(readyStatus).toContain('identity="aliceinjected"');
++		expect(readyStatus).toContain("used=30.0%, soft=50.0%, hard=65.0%, reset=5h 0m");
++		expect(readyStatus).toContain("Restart OMP after editing");
++	});
++
++	it("returns unconfigured when the provider is absent and throws for unsupported routes or no accounts", async () => {
++		const baseOptions = { agentDir: "/agent", policy: readyPolicy(), now: () => NOW };
++		const missing = new SubscriptionUsageController({ ...baseOptions, source: sourceFor([]) });
++		expect(await missing.admit({ provider: "other-provider" })).toEqual({ status: "unconfigured" });
++
++		const unsupported = new SubscriptionUsageController({
++			...baseOptions,
++			source: { candidates: async () => ({ supported: false, candidates: [] }) },
++		});
++		await expect(unsupported.admit({ provider: "test-provider" })).rejects.toMatchObject({ reason: "unsupported" });
++
++		const empty = new SubscriptionUsageController({ ...baseOptions, source: sourceFor([]) });
++		await expect(empty.admit({ provider: "test-provider" })).rejects.toMatchObject({ reason: "unknown" });
++	});
++
++	it("counts a shared quota pool once and uses its smallest row capacity", async () => {
++		const policy = readyPolicy({
++			maxInFlight: 4,
++			fiveHourHard: 100,
++			fiveHourSoft: 100,
++			weeklyHard: 100,
++			weeklySoft: 100,
++			accounts: {},
++		});
++		// Hard caps are constant 100. Headroom = 100 - used. Pool A rows report
++		// 65% and 90% used => capacities 2 and 1; the pool counts once as 1.
++		// Pool B reports 50% used => capacity 2. Provider ceiling = 3.
++		const source = sourceFor([
++			candidate({ credentialId: 1, poolId: "pool-a", fiveHourUsed: 0.65, weeklyUsed: 0.65 }),
++			candidate({ credentialId: 2, poolId: "pool-a", order: 1, fiveHourUsed: 0.9, weeklyUsed: 0.9 }),
++			candidate({ credentialId: 3, poolId: "pool-b", order: 2, fiveHourUsed: 0.5, weeklyUsed: 0.5 }),
++		]);
++		const controller = new SubscriptionUsageController({
++			agentDir: "/agent",
++			policy,
++			source,
++			now: () => NOW,
++			sleep: signalAwareSleep(),
++		});
++
++		expect((await controller.admit({ provider: "test-provider" })).status).toBe("admitted");
++		expect((await controller.admit({ provider: "test-provider" })).status).toBe("admitted");
++		expect((await controller.admit({ provider: "test-provider" })).status).toBe("admitted");
++		await expect(controller.admit({ provider: "test-provider" })).rejects.toBeInstanceOf(
++			SubscriptionUsagePolicyError,
++		);
++	});
++});
+diff --git a/packages/coding-agent/test/subscription-usage-wiring.test.ts b/packages/coding-agent/test/subscription-usage-wiring.test.ts
+new file mode 100644
+index 0000000..b7389a7
+--- /dev/null
++++ b/packages/coding-agent/test/subscription-usage-wiring.test.ts
+@@ -0,0 +1,92 @@
++import { afterEach, describe, expect, it } from "bun:test";
++import {
++	type ApiKey,
++	type ApiKeyResolveContext,
++	type ApiKeyResolver,
++	SubscriptionUsagePolicyError,
++} from "@oh-my-pi/pi-ai";
++import type { Model } from "@oh-my-pi/pi-ai/types";
++import {
++	resetSubscriptionUsageControllersForTesting,
++	setSubscriptionUsageControllerForTesting,
++	withSubscriptionUsagePolicy,
++} from "../src/task/subscription-usage-wiring";
++
++const AGENT_DIR = "/tmp/subscription-usage-wiring-test";
++
++function model(): Model {
++	return {
++		id: "model-1",
++		name: "Model 1",
++		api: "openai-codex-responses",
++		provider: "openai-codex",
++		contextWindow: 1000,
++		maxTokens: 100,
++	} as Model;
++}
++
++function wrap(base: ApiKeyResolver): ApiKeyResolver {
++	const wrapped = withSubscriptionUsagePolicy(model => base, {
++		agentDir: AGENT_DIR,
++		sessionId: () => "session-1",
++	});
++	return wrapped(model()) as ApiKeyResolver;
++}
++
++describe("subscription usage wiring", () => {
++	afterEach(() => resetSubscriptionUsageControllersForTesting());
++
++	it("pins the admitted credential and releases its lease exactly once", async () => {
++		const released: number[] = [];
++		setSubscriptionUsageControllerForTesting(AGENT_DIR, {
++			admit: async () => ({ status: "admitted", credentialId: 42, leaseId: 7 }),
++			release: async leaseId => {
++				released.push(leaseId);
++			},
++			status: async () => "",
++		});
++		const contexts: ApiKeyResolveContext[] = [];
++		const resolver = wrap(ctx => {
++			contexts.push(ctx);
++			return { apiKey: "bearer-42", credentialId: 42 };
++		});
++		const resolved = await resolver({ lastChance: false, error: undefined });
++		expect(contexts[0]?.preferredCredentialId).toBe(42);
++		expect(typeof resolved === "object" && resolved.credentialId).toBe(42);
++		const admission = typeof resolved === "object" ? resolved.providerAttemptAdmission : undefined;
++		expect(admission).toBeDefined();
++		const release = await admission!.reserve(42);
++		await release();
++		await release();
++		expect(released).toEqual([7]);
++	});
++
++	it("refuses a dispatched credential that differs from the admitted row", async () => {
++		const released: number[] = [];
++		setSubscriptionUsageControllerForTesting(AGENT_DIR, {
++			admit: async () => ({ status: "admitted", credentialId: 42, leaseId: 9 }),
++			release: async leaseId => {
++				released.push(leaseId);
++			},
++			status: async () => "",
++		});
++		const resolver = wrap(() => ({ apiKey: "bearer-7", credentialId: 7 }));
++		await expect(resolver({ lastChance: false, error: undefined })).rejects.toBeInstanceOf(
++			SubscriptionUsagePolicyError,
++		);
++		expect(released).toEqual([9]);
++	});
++
++	it("passes through unresolvable static keys and unconfigured providers", async () => {
++		setSubscriptionUsageControllerForTesting(AGENT_DIR, {
++			admit: async () => ({ status: "unconfigured" }),
++			release: async () => {},
++			status: async () => "",
++		});
++		const wrapped = withSubscriptionUsagePolicy(model => "static-key" satisfies ApiKey, {
++			agentDir: AGENT_DIR,
++			sessionId: () => "session-1",
++		});
++		expect(wrapped(model())).toBe("static-key");
++	});
++});
+diff --git a/packages/coding-agent/test/subscription-usage.test.ts b/packages/coding-agent/test/subscription-usage.test.ts
+new file mode 100644
+index 0000000..2a87da8
+--- /dev/null
++++ b/packages/coding-agent/test/subscription-usage.test.ts
+@@ -0,0 +1,180 @@
++import { describe, expect, test } from "bun:test";
++import * as fs from "node:fs/promises";
++import * as os from "node:os";
++import * as path from "node:path";
++import {
++	curveFor,
++	evaluateCurve,
++	loadSubscriptionUsagePolicy,
++	SUBSCRIPTION_USAGE_FILENAME,
++	type PolicyLoad,
++	type WindowCurve,
++} from "../src/task/subscription-usage";
++
++const EXAMPLE_POLICY = `version: 1
++providers:
++  openai-codex:
++    maxInFlight: 4
++    maxWait: 5m
++    windows:
++      5h:
++        mode: linear
++        points:
++          - ["5h", 10, 5]
++          - ["0m", 100, 95]
++      7d:
++        mode: linear
++        points:
++          - ["7d", 20]
++          - ["1d", 90]
++          - ["0h", 97]
++    accounts:
++      "credential:42":
++        windows:
++          5h:
++            mode: step
++            points:
++              - ["5h", 0]
++              - ["0m", 100]
++`;
++
++const VALID_WINDOWS = `    windows:
++      5h:
++        mode: linear
++        points: [["5h", 10], ["0m", 100]]
++      7d:
++        mode: linear
++        points: [["7d", 20], ["1d", 90], ["0h", 97]]`;
++
++async function withTempDir<T>(run: (dir: string) => Promise<T>): Promise<T> {
++	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-subscription-usage-"));
++	try {
++		return await run(dir);
++	} finally {
++		await fs.rm(dir, { recursive: true, force: true });
++	}
++}
++
++async function loadYaml(yaml: string): Promise<PolicyLoad> {
++	return withTempDir(async dir => {
++		await fs.writeFile(path.join(dir, SUBSCRIPTION_USAGE_FILENAME), yaml);
++		return loadSubscriptionUsagePolicy(dir);
++	});
++}
++
++function expectFieldError(result: PolicyLoad, field: string): void {
++	expect(result.status).toBe("error");
++	if (result.status === "error") {
++		expect(result.message).toContain(result.path);
++		expect(result.message).toContain(field);
++	}
++}
++
++function weeklyCurve(mode: WindowCurve["mode"]): WindowCurve {
++	return {
++		mode,
++		points: [
++			{ remainingMinutes: 7 * 24 * 60, hardPercent: 20, softPercent: 10 },
++			{ remainingMinutes: 24 * 60, hardPercent: 90, softPercent: 80 },
++			{ remainingMinutes: 0, hardPercent: 97, softPercent: 95 },
++		],
++	};
++}
++
++describe("subscription usage policy", () => {
++	test("loads the example policy and applies account window overrides without merging", async () => {
++		const result = await loadYaml(EXAMPLE_POLICY);
++		expect(result.status).toBe("ready");
++		if (result.status !== "ready") return;
++
++		const provider = result.policy.providers["openai-codex"];
++		expect(provider.maxInFlight).toBe(4);
++		expect(provider.maxWaitMs).toBe(5 * 60_000);
++		const overridden = curveFor(provider, "fiveHour", 42);
++		expect(overridden).toBe(provider.accounts["credential:42"]!.windows.fiveHour!);
++		expect(overridden.mode).toBe("step");
++		expect(overridden.points).toHaveLength(2);
++		expect(curveFor(provider, "weekly", 42)).toBe(provider.weekly);
++		expect(curveFor(provider, "fiveHour", 43)).toBe(provider.fiveHour);
++	});
++
++	test("evaluates linear weekly points at endpoints, knots, and the midpoint", async () => {
++		const result = await loadYaml(EXAMPLE_POLICY);
++		expect(result.status).toBe("ready");
++		if (result.status !== "ready") return;
++		const curve = result.policy.providers["openai-codex"].weekly;
++
++		expect(evaluateCurve(curve, 7 * 24 * 60)).toEqual({ hardPercent: 20 });
++		expect(evaluateCurve(curve, 4 * 24 * 60)).toEqual({ hardPercent: 55 });
++		expect(evaluateCurve(curve, 24 * 60)).toEqual({ hardPercent: 90 });
++	});
++
++	test("step holds the earlier point until an exact knot", () => {
++		const curve = weeklyCurve("step");
++		expect(evaluateCurve(curve, 4 * 24 * 60)).toEqual({ hardPercent: 20, softPercent: 10 });
++		expect(evaluateCurve(curve, 24 * 60)).toEqual({ hardPercent: 90, softPercent: 80 });
++	});
++
++	test("smooth interpolation and soft values share the curve shape and clamp at endpoints", () => {
++		const curve = weeklyCurve("smooth");
++		expect(evaluateCurve(curve, 5.5 * 24 * 60)).toEqual({ hardPercent: 30.9375, softPercent: 20.9375 });
++		expect(evaluateCurve(curve, 8 * 24 * 60)).toEqual({ hardPercent: 20, softPercent: 10 });
++		expect(evaluateCurve(curve, -1)).toEqual({ hardPercent: 97, softPercent: 95 });
++		expect(evaluateCurve(curve, Number.NaN)).toBeUndefined();
++	});
++
++	test("rejects malformed curve points with their field path", async () => {
++		const yaml = `version: 1\nproviders:\n  test:\n    maxInFlight: 2\n${VALID_WINDOWS.replace('["1d", 90]', '["1d", "bad"]')}`;
++		expectFieldError(await loadYaml(yaml), "providers.test.windows.7d.points[1][1]");
++	});
++
++	test("rejects duplicate curve durations", async () => {
++		const yaml = `version: 1\nproviders:\n  test:\n    maxInFlight: 2\n${VALID_WINDOWS.replace('["1d", 90]', '["7d", 90]')}`;
++		expectFieldError(await loadYaml(yaml), "providers.test.windows.7d.points[1][0]");
++	});
++
++	test("rejects invalid maxInFlight, missing windows, and descending soft caps", async () => {
++		const badMax = `version: 1\nproviders:\n  test:\n    maxInFlight: 0\n${VALID_WINDOWS}`;
++		expectFieldError(await loadYaml(badMax), "providers.test.maxInFlight");
++
++		const missingWeekly = `version: 1\nproviders:\n  test:\n    maxInFlight: 2\n    windows:\n      5h:\n        mode: linear\n        points: [["5h", 10], ["0m", 100]]\n`;
++		expectFieldError(await loadYaml(missingWeekly), "providers.test.windows.7d");
++
++		const badSoft = `version: 1\nproviders:\n  test:\n    maxInFlight: 2\n    windows:\n      5h:\n        mode: linear\n        points: [["5h", 10, 5], ["0m", 100, 4]]\n      7d:\n        mode: linear\n        points: [["7d", 20], ["0h", 97]]\n`;
++		expectFieldError(await loadYaml(badSoft), "providers.test.windows.5h.points[1][2]");
++	});
++
++	test("uses the five-minute default when maxWait is omitted", async () => {
++		const yaml = `version: 1\nproviders:\n  test:\n    maxInFlight: 2\n${VALID_WINDOWS}`;
++		const result = await loadYaml(yaml);
++		expect(result.status).toBe("ready");
++		if (result.status === "ready") expect(result.policy.providers.test.maxWaitMs).toBe(5 * 60_000);
++	});
++
++	test("treats an absent agent config as disabled", async () => {
++		await withTempDir(async dir => {
++			expect(loadSubscriptionUsagePolicy(dir)).toEqual({
++				status: "disabled",
++				path: path.join(dir, SUBSCRIPTION_USAGE_FILENAME),
++			});
++		});
++	});
++
++	test("ignores a project-directory policy and reads only the agent directory", async () => {
++		await withTempDir(async root => {
++			const agentDir = path.join(root, "agent");
++			await fs.mkdir(agentDir);
++			await fs.writeFile(path.join(root, SUBSCRIPTION_USAGE_FILENAME), EXAMPLE_POLICY);
++			const originalCwd = process.cwd();
++			try {
++				process.chdir(root);
++				expect(loadSubscriptionUsagePolicy(agentDir)).toEqual({
++					status: "disabled",
++					path: path.join(agentDir, SUBSCRIPTION_USAGE_FILENAME),
++				});
++			} finally {
++				process.chdir(originalCwd);
++			}
++		});
++	});
++});

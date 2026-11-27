@@ -1,0 +1,44 @@
+# Opt-in subscription usage policy for oh-my-pi.
+#
+# Location: <profile-agent-dir>/subscription-usage.yml
+#   default profile: ~/.omp/agent/subscription-usage.yml
+#   named profile:   ~/.omp/profiles/<name>/agent/subscription-usage.yml
+#
+# Read once at profile startup. Edit and restart OMP, then inspect it with
+# /subscription-usage. Delete the file (or leave providers empty) to disable.
+version: 1
+
+providers:
+  openai-codex:
+    # Ceiling for background/subagent requests, not interactive chat.
+    maxInFlight: 4
+    # Wait bound measured from the first temporary quota denial. `0m` refuses
+    # immediately after one bounded native auth/usage resolution.
+    maxWait: 5m
+    windows:
+      # Both windows are required.
+      5h:
+        mode: linear # linear | step | smooth
+        points: # [time remaining, hard % used, optional soft % used]
+          - [5h, 20, 10]
+          - [1h, 80, 65]
+          - [0h, 95, 85]
+      7d:
+        mode: smooth
+        points:
+          - [7d, 20, 15]
+          - [3d, 55, 45]
+          - [1d, 90, 75]
+          - [0h, 97, 90]
+    # Optional per-account overrides keyed by durable credential row id.
+    # `accounts: {}` disables overrides.
+    accounts: {}
+    # Example: replace only the weekly curve for credential row 42.
+    # accounts:
+    #   "credential:42":
+    #     windows:
+    #       7d:
+    #         mode: step
+    #         points:
+    #           - [7d, 10]
+    #           - [0h, 95]

@@ -1,0 +1,14 @@
+omp-subscription-usage
+=====================
+
+This repository contains a patch and installer for oh-my-pi v19.2.1:
+  https://github.com/can1357/oh-my-pi
+
+oh-my-pi is MIT-licensed:
+  Copyright (c) 2025 Mario Zechner
+  Copyright (c) 2025-2026 Can Bölük
+  Copyright (c) 2026 Stencil Labs, Inc.
+
+The patch in patches/ and the installer are provided under the same MIT terms.
+No upstream source tree is vendored in this repository; install.sh fetches the
+tag from the upstream repository and applies the patch.
