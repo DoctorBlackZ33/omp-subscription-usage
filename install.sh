@@ -14,7 +14,7 @@
 set -euo pipefail
 
 REPO_SLUG="DoctorBlackZ33/omp-subscription-usage"
-REF="${OMP_SUB_REF:-v0.2.1}"
+REF="${OMP_SUB_REF:-v0.2.2}"
 RAW_BASE="https://raw.githubusercontent.com/$REPO_SLUG/$REF"
 OMP_TAG="${OMP_TAG:-v19.2.1}"
 PATCH_REL="patches/0001-subscription-usage-policy.patch"
@@ -206,13 +206,14 @@ if [ -z "$OMP_DIR" ]; then
 	if [ -d "$DEFAULT_OMP_DIR" ]; then
 		OMP_DIR="$DEFAULT_OMP_DIR"
 		if [ "$INTERACTIVE" = "1" ]; then
-			answer="$(ask "Found OMP directory: $OMP_DIR. Use it? [Y/n/custom] " "y")"
+			answer="$(ask "Found OMP directory: $OMP_DIR. Use it? [Y/n/custom path] " "y")"
 			case "$answer" in
+				y | Y | yes | YES | "") : ;;
 				n | N | no | NO) OMP_DIR="" ;;
 				c | C | custom | CUSTOM)
 					OMP_DIR="$(expand_path "$(ask "OMP directory: " "$DEFAULT_OMP_DIR")")"
 					;;
-				*) : ;;
+				*) OMP_DIR="$(expand_path "$answer")" ;;
 			esac
 		fi
 	else
@@ -226,7 +227,12 @@ else
 	OMP_DIR="$(expand_path "$OMP_DIR")"
 fi
 
-[ -n "$OMP_DIR" ] || OMP_DIR="$DEFAULT_OMP_DIR"
+if [ -z "$OMP_DIR" ]; then
+	if [ "$INTERACTIVE" = "1" ]; then
+		OMP_DIR="$(expand_path "$(ask "OMP directory: " "$DEFAULT_OMP_DIR")")"
+	fi
+	[ -n "$OMP_DIR" ] || OMP_DIR="$DEFAULT_OMP_DIR"
+fi
 
 # Convenience: a source checkout passed as the OMP directory selects the
 # checkout; the state root falls back to the default.

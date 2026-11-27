@@ -31,7 +31,7 @@ fetches Bun if it is missing.
 One command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/v0.2.1/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/v0.2.2/install.sh | bash
 ```
 
 The installer:
@@ -51,7 +51,7 @@ The installer:
 Non-interactive / scripted:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/v0.2.1/install.sh \
+curl -fsSL https://raw.githubusercontent.com/DoctorBlackZ33/omp-subscription-usage/v0.2.2/install.sh \
   | bash -s -- --yes --omp-dir "$HOME/.omp" --profiles all
 ```
 
